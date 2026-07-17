@@ -40,13 +40,16 @@ class MLBacktestService:
         if source_run_id:
             try:
                 source = self.experiments.get(source_run_id)
-                if source.kind == "ml_training" and source.status == "completed":
+                if (
+                    source.kind in {"ml_training", "ml_search"}
+                    and source.status == "completed"
+                ):
                     return source
             except ValueError:
                 pass
         for manifest in self.experiments.list():
             if (
-                manifest.kind == "ml_training"
+                manifest.kind in {"ml_training", "ml_search"}
                 and manifest.status == "completed"
                 and manifest.result.get("model_version") == version
             ):

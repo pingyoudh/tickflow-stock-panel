@@ -15,7 +15,7 @@ import numpy as np
 import polars as pl
 
 from app.backtest.engine import BacktestEngine
-from app.quant.factors import builtin_factor_columns
+from app.quant.factors import FactorRegistry, builtin_factor_columns
 
 logger = logging.getLogger(__name__)
 
@@ -93,8 +93,9 @@ class FactorResult:
 
 
 class FactorBacktestService:
-    def __init__(self, engine: BacktestEngine) -> None:
+    def __init__(self, engine: BacktestEngine, registry: FactorRegistry | None = None) -> None:
         self.engine = engine
+        self.registry = registry
 
     def run(self, config: FactorConfig) -> FactorResult:
         t0 = time.perf_counter()
@@ -108,13 +109,31 @@ class FactorBacktestService:
                 elapsed_ms=(time.perf_counter() - t0) * 1000,
             )
 
-        # 加载基础面板: 当前 enriched parquet 只持久化基础列, 指标因子可能需要运行时计算。
-        panel_columns = ["symbol", "date", "open", "high", "low", "close", "volume", "turnover_rate"]
+        factor_def = None
+        if self.registry is not None:
+            try:
+                factor_def = self.registry.get(config.factor_name)
+            except ValueError:
+                factor_def = None
+            if factor_def is not None:
+                if not factor_def.enabled:
+                    return _err(f"因子 '{factor_def.name}' 已禁用")
+                if factor_def.compute_status != "ready":
+                    return _err(f"因子 '{factor_def.name}' 不可计算: {factor_def.blocked_reason or factor_def.compute_status}")
+                if config.asset_type not in factor_def.asset_types:
+                    return _err(f"因子 '{factor_def.name}' 不支持资产类型 {config.asset_type}")
+
+        # 加载基础面板: 当前 enriched parquet 只持久化基础列, 指标/表达式因子运行时计算。
+        panel_columns = ["symbol", "date", "open", "high", "low", "close", "volume", "amount", "turnover_rate"]
+        for name in (factor_def.inputs if factor_def is not None else [config.factor_name]):
+            if name not in panel_columns:
+                panel_columns.append(name)
         if config.factor_name not in panel_columns:
             panel_columns.append(config.factor_name)
         load_start = config.start
         if config.factor_name not in {"turnover_rate"}:
-            load_start = config.start - timedelta(days=FACTOR_WARMUP_DAYS)
+            warmup = max(FACTOR_WARMUP_DAYS, factor_def.warmup if factor_def is not None else 0)
+            load_start = config.start - timedelta(days=warmup)
 
         panel = self.engine.load_panel(
             config.symbols,
@@ -127,8 +146,18 @@ class FactorBacktestService:
             return _err("无数据，请检查日期范围或先运行盘后管道")
 
         factor_col = config.factor_name
+        if factor_def is not None and factor_def.authoring_type != "builtin":
+            try:
+                panel = self.registry.evaluate(panel, factor_def) if self.registry is not None else panel
+            except Exception as exc:  # noqa: BLE001
+                return _err(str(exc))
         if factor_col not in panel.columns:
             panel = self._compute_missing_factor(panel, factor_col)
+        if factor_def is not None and factor_col not in panel.columns:
+            try:
+                panel = self.registry.evaluate(panel, factor_def) if self.registry is not None else panel
+            except Exception as exc:  # noqa: BLE001
+                return _err(str(exc))
         if factor_col not in panel.columns:
             return _err(f"因子列 '{factor_col}' 不存在于 enriched 数据中, 且无法从基础行情计算")
         if "close" not in panel.columns:

@@ -36,6 +36,18 @@ class FactorDefinition(BaseModel):
     expression: dict[str, Any] | None = None
     trusted: bool = False
     readonly: bool = False
+    enabled: bool = True
+    origin: str = "user"
+    library_name: str = ""
+    admission_status: str = "unscreened"
+    compute_status: str = "ready"
+    blocked_reason: str = ""
+    source_expression: str = ""
+    source_file: str = ""
+    source_row: str = ""
+    tags: list[str] = Field(default_factory=list)
+    operators: list[str] = Field(default_factory=list)
+    raw_fields: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_expression(self) -> FactorDefinition:
@@ -116,9 +128,19 @@ class ModelSpec(BaseModel):
         if self.start >= self.end:
             raise ValueError("训练开始日期必须早于结束日期")
         if self.asset_type == "etf" and "target" not in self.model_fields_set:
-            raise ValueError("ETF 训练必须显式选择基准或股票池截面平均收益")
+            self.target = TargetSpec(
+                horizon=5,
+                benchmark_mode="cross_section_mean",
+                benchmark_symbol=None,
+            )
         if self.asset_type == "etf" and self.target.benchmark_mode == "index" and not self.target.benchmark_symbol:
             raise ValueError("ETF 指数超额标签必须显式指定基准")
+        if self.asset_type == "etf" and self.symbols is None:
+            self.universe_filters = {
+                "min_history_days": 120,
+                "min_median_amount_20d": 10_000_000.0,
+                **self.universe_filters,
+            }
         if self.feature_versions and not set(self.feature_versions).issubset(self.features):
             raise ValueError("feature_versions 只能包含 features 中的因子")
         return self
@@ -146,6 +168,7 @@ class MLSearchSpec(BaseModel):
         default_factory=lambda: ["elastic_net", "lightgbm", "xgboost"], min_length=1
     )
     budget: Literal["quick", "standard", "overnight"] = "standard"
+    search_strategy: Literal["adaptive", "exhaustive"] = "adaptive"
     min_features: int = Field(default=8, ge=1, le=30)
     max_features: int = Field(default=30, ge=1, le=30)
     shortlist_limit: int = Field(default=80, ge=8, le=200)
@@ -179,7 +202,17 @@ class MLSearchSpec(BaseModel):
         if len(set(self.algorithms)) != len(self.algorithms):
             raise ValueError("algorithms 不能重复")
         if self.asset_type == "etf" and "target" not in self.model_fields_set:
-            raise ValueError("ETF 智能训练必须显式选择基准或截面平均收益")
+            self.target = TargetSpec(
+                horizon=5,
+                benchmark_mode="cross_section_mean",
+                benchmark_symbol=None,
+            )
+        if self.asset_type == "etf" and self.symbols is None:
+            self.universe_filters = {
+                "min_history_days": 120,
+                "min_median_amount_20d": 10_000_000.0,
+                **self.universe_filters,
+            }
         return self
 
 

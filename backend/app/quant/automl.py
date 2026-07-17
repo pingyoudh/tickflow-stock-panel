@@ -17,9 +17,9 @@ import numpy as np
 import polars as pl
 
 from app.quant.adapters import get_adapter, model_artifact_name, write_model_metadata
-from app.quant.dataset import MLDatasetBuilder
+from app.quant.dataset import MLDatasetBuilder, MLSearchDataset
 from app.quant.factors import FactorRegistry
-from app.quant.metrics import evaluate_oos
+from app.quant.metrics import evaluate_oos, rank_values
 from app.quant.model_registry import ModelRegistry
 from app.quant.models import MLSearchSpec, ModelSpec, ResearchPanelSpec
 from app.quant.splits import assert_no_label_overlap, generate_purged_folds
@@ -32,6 +32,19 @@ _BUDGET_TRIALS = {
     "overnight": {"elastic_net": 30, "lightgbm": 75, "xgboost": 75},
 }
 _SUBSET_SIZES = (8, 12, 16, 20, 24, 30)
+_ADAPTIVE_SURVIVORS = {
+    "quick": (6, 4),
+    "standard": (24, 12),
+    "overnight": (54, 18),
+}
+_PREFILTER_LIMIT = 240
+
+
+def _finite_rows(frame: pl.DataFrame, columns: list[str]) -> pl.DataFrame:
+    return frame.filter(pl.all_horizontal([
+        pl.col(name).cast(pl.Float64, strict=False).is_finite()
+        for name in columns
+    ]))
 
 
 @dataclass(frozen=True)
@@ -70,9 +83,21 @@ class AutoMLSearchEngine:
         required = wf.train_days + wf.validation_days + wf.test_days + spec.target.horizon * 2
         outer_folds = max(0, 1 + (trading_days - required) // wf.step_days)
         trials = sum(self._trial_counts(spec).values())
-        fits = (outer_folds + 1) * (trials * spec.inner_folds + 1)
+        stage_sizes = self._stage_sizes(spec)
+        fits_per_window = (
+            trials * 1
+            + stage_sizes[1] * min(2, spec.inner_folds)
+            + stage_sizes[2] * spec.inner_folds
+        ) if spec.search_strategy == "adaptive" else trials * spec.inner_folds
+        fits = (outer_folds + 1) * fits_per_window + outer_folds + 1
         hours = {"quick": 0.5, "standard": 3.0, "overnight": 10.0}[spec.budget]
         hours *= max(0.5, min(2.0, len(definitions) / 40))
+        versions = {item.id: item.version for item in definitions}
+        base_spec = self._model_spec(
+            spec, "lightgbm", list(versions), versions, model_id=spec.id
+        )
+        cache = self.datasets.factor_cache.inspect(base_spec, definitions)
+        hours *= max(0.35, 1.0 - 0.55 * cache["hit_ratio"])
         warnings = [*panel.get("warnings", []), *panel.get("missing_data", [])]
         if not panel.get("allowed", True):
             warnings.append(panel.get("reason") or "预计数据量超过本地限制")
@@ -85,6 +110,8 @@ class AutoMLSearchEngine:
             "search_trials_per_window": trials,
             "estimated_model_fits": fits,
             "estimated_hours": round(hours, 1),
+            "search_stages": list(stage_sizes),
+            "factor_cache": cache,
             "warnings": list(dict.fromkeys(warnings)),
         }
 
@@ -102,9 +129,16 @@ class AutoMLSearchEngine:
         base_spec = self._model_spec(
             spec, "lightgbm", list(feature_versions), feature_versions, model_id=spec.id
         )
-        progress(0.03, "正在构建多因子研究面板")
-        dataset = self.datasets.build(
-            base_spec, cancelled=cancelled, require_complete_features=False
+        progress(0.02, "正在构建标签面板并准备因子缓存")
+        dataset = self.datasets.prepare_search(
+            base_spec,
+            definitions,
+            cancelled=cancelled,
+            on_stage=lambda message: progress(0.02, message),
+            on_factor=lambda current, total, event: progress(
+                0.02 + 0.10 * current / max(1, total),
+                f"因子缓存 {current}/{total} · {'命中' if event['hit'] else '计算'}",
+            ),
         )
         self._check_cancelled(cancelled)
         folds = generate_purged_folds(
@@ -125,28 +159,41 @@ class AutoMLSearchEngine:
 
         for index, fold in enumerate(folds):
             self._check_cancelled(cancelled)
-            train = dataset.frame.filter(pl.col("date").is_in(fold.train_dates))
-            validation = dataset.frame.filter(pl.col("date").is_in(fold.validation_dates))
-            test = dataset.frame.filter(pl.col("date").is_in(fold.test_dates))
-            total_test_rows += test.height
+            train_base = dataset.base_frame.filter(pl.col("date").is_in(fold.train_dates))
+            validation_base = dataset.base_frame.filter(
+                pl.col("date").is_in(fold.validation_dates)
+            )
+            test_base = dataset.base_frame.filter(pl.col("date").is_in(fold.test_dates))
+            total_test_rows += test_base.height
             def fold_progress(
                 fraction: float, message: str, *, outer_index: int = index
             ) -> None:
                 progress(
-                    0.06 + 0.68 * (outer_index + fraction) / len(folds),
+                    0.13 + 0.61 * (outer_index + fraction) / len(folds),
                     f"外层第 {outer_index + 1}/{len(folds)} 折 · {message}",
                 )
 
             window = self._search_window(
-                train, spec, list(feature_versions), cancelled,
+                dataset, train_base, spec, list(feature_versions), cancelled,
                 fold_progress,
             )
             winner = window["winner"]
+            train = self.datasets.attach_search_features(
+                dataset, winner["features"], train_base
+            )
+            validation = self.datasets.attach_search_features(
+                dataset, winner["features"], validation_base
+            )
             fitted = self._fit(
                 winner["algorithm"], winner["features"], winner["params"], spec,
                 train, validation, cancelled,
             )
-            valid_test = test.drop_nulls(winner["features"])
+            test = self.datasets.attach_search_features(
+                dataset, winner["features"], test_base
+            )
+            valid_test = _finite_rows(
+                test, [*winner["features"], "target"]
+            )
             if valid_test.is_empty():
                 raise ValueError(f"外层第 {index + 1} 折冠军在测试集没有完整特征")
             values = get_adapter(winner["algorithm"]).predict(
@@ -197,11 +244,11 @@ class AutoMLSearchEngine:
             all_warnings.append("OOS 折数或交易日不足, 模型最高为待验证")
 
         progress(0.78, "正在最新训练窗口重新选择发布候选")
-        labeled_dates = sorted(dataset.frame["date"].unique().to_list())
+        labeled_dates = sorted(dataset.base_frame["date"].unique().to_list())
         latest_dates = labeled_dates[-min(len(labeled_dates), spec.walk_forward.train_days):]
-        latest_frame = dataset.frame.filter(pl.col("date").is_in(latest_dates))
+        latest_base = dataset.base_frame.filter(pl.col("date").is_in(latest_dates))
         final_window = self._search_window(
-            latest_frame, spec, list(feature_versions), cancelled,
+            dataset, latest_base, spec, list(feature_versions), cancelled,
             lambda fraction, message: progress(0.78 + 0.15 * fraction, f"最新窗口 · {message}"),
         )
         champion = final_window["winner"]
@@ -213,8 +260,18 @@ class AutoMLSearchEngine:
         validation_days = min(
             spec.walk_forward.validation_days, max(20, len(labeled_dates) // 5)
         )
-        final_train = dataset.frame.filter(pl.col("date") < labeled_dates[-validation_days])
-        final_validation = dataset.frame.filter(pl.col("date") >= labeled_dates[-validation_days])
+        final_train_base = dataset.base_frame.filter(
+            pl.col("date") < labeled_dates[-validation_days]
+        )
+        final_validation_base = dataset.base_frame.filter(
+            pl.col("date") >= labeled_dates[-validation_days]
+        )
+        final_train = self.datasets.attach_search_features(
+            dataset, champion["features"], final_train_base
+        )
+        final_validation = self.datasets.attach_search_features(
+            dataset, champion["features"], final_validation_base
+        )
         final_fit = self._fit(
             champion["algorithm"], champion["features"], champion["params"], spec,
             final_train, final_validation, cancelled,
@@ -233,7 +290,7 @@ class AutoMLSearchEngine:
         schema = {
             "features": champion["features"],
             "dtypes": {
-                name: str(dataset.frame.schema[name]) for name in champion["features"]
+                name: str(final_train.schema[name]) for name in champion["features"]
             },
         }
         training = {
@@ -278,8 +335,11 @@ class AutoMLSearchEngine:
             },
             "data_fingerprint": dataset.fingerprint,
             "input_file_fingerprint": dataset.input_file_fingerprint,
-            "rows": dataset.frame.height,
-            "date_range": [str(dataset.frame["date"].min()), str(dataset.frame["date"].max())],
+            "rows": dataset.base_frame.height,
+            "date_range": [
+                str(dataset.base_frame["date"].min()),
+                str(dataset.base_frame["date"].max()),
+            ],
             "factor_funnel": {
                 "submitted": len(spec.factor_pool),
                 "quality_passed": sum(item["status"] == "accepted" for item in latest_quality),
@@ -292,6 +352,16 @@ class AutoMLSearchEngine:
             "candidate_leaderboard": sorted(
                 final_window["trials"], key=lambda item: item.get("score", -999), reverse=True
             )[:20],
+            "search_stages": final_window.get("stages", []),
+            "factor_cache": {
+                "hits": sum(bool(item.get("hit")) for item in dataset.cache_events),
+                "misses": sum(not bool(item.get("hit")) for item in dataset.cache_events),
+                "bytes_written": sum(
+                    int(item.get("bytes_written", 0))
+                    for item in dataset.cache_events
+                ),
+                **self.datasets.factor_cache.status(),
+            },
             "folds": fold_results, "metrics": metrics,
             "selection_backtest": selection_backtest,
             "feature_importance": importance, "training": training,
@@ -300,11 +370,13 @@ class AutoMLSearchEngine:
         (run_dir / "result.json").write_text(
             json.dumps(result, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
         )
+        self.datasets.factor_cache.evict()
         progress(1.0, "智能训练完成, 冠军模型等待手动发布")
         return result
 
     def _search_window(
         self,
+        dataset: MLSearchDataset,
         frame: pl.DataFrame,
         spec: MLSearchSpec,
         factors: list[str],
@@ -313,18 +385,46 @@ class AutoMLSearchEngine:
     ) -> dict[str, Any]:
         required_order = [item.id for item in spec.required_factors]
         required = set(required_order)
-        quality = self._factor_quality(frame, factors, required)
+        quality: list[dict[str, Any]] = []
+        for index, factor_id in enumerate(factors):
+            self._check_cancelled(cancelled)
+            factor_frame = self.datasets.attach_search_features(
+                dataset, [factor_id], frame
+            )
+            quality.extend(self._factor_quality(
+                factor_frame, [factor_id], required
+            ))
+            progress(
+                0.01 + 0.07 * (index + 1) / max(1, len(factors)),
+                f"质量筛选 {index + 1}/{len(factors)}",
+            )
         accepted = [item["factor_id"] for item in quality if item["status"] == "accepted"]
         if len(accepted) < spec.min_features:
             raise ValueError(
                 f"质量筛选后只有 {len(accepted)} 个因子, 少于最小值 {spec.min_features}"
             )
         progress(0.08, f"质量筛选保留 {len(accepted)}/{len(factors)} 个因子")
+        prefiltered = self._prefilter_factors(
+            accepted,
+            quality,
+            dataset.definitions,
+            required_order,
+            spec.seed,
+            min(
+                _PREFILTER_LIMIT,
+                max(spec.shortlist_limit * 3, spec.min_features),
+            ),
+        )
+        prepared = self.datasets.attach_search_features(
+            dataset, prefiltered, frame
+        )
         clusters, representatives = self._correlation_clusters(
-            frame, accepted, quality, required
+            prepared, prefiltered, quality, required
         )
         progress(0.14, f"相关性聚类得到 {len(clusters)} 个因子组")
-        permutation = self._permutation_importance(frame, representatives, spec.seed)
+        permutation = self._permutation_importance(
+            prepared, representatives, spec.seed
+        )
         quality_rank = sorted(
             representatives,
             key=lambda name: next(item["selection_rank"] for item in quality if item["factor_id"] == name),
@@ -345,22 +445,40 @@ class AutoMLSearchEngine:
             sorted(frame["date"].unique().to_list()), spec.inner_folds,
             spec.inner_validation_days, spec.target.horizon,
         )
-        trials: list[dict[str, Any]] = []
         trial_specs = self._trial_specs(spec, shortlist)
-        for index, trial in enumerate(trial_specs):
-            self._check_cancelled(cancelled)
-            try:
-                result = self._evaluate_trial(frame, spec, folds, trial, cancelled)
-            except InterruptedError:
-                raise
-            except Exception as exc:
-                result = {**trial, "status": "failed", "error": str(exc), "score": -999.0}
-            trials.append(result)
-            progress(
-                0.20 + 0.78 * (index + 1) / max(1, len(trial_specs)),
-                f"完成候选 {index + 1}/{len(trial_specs)}",
+        if spec.search_strategy == "adaptive":
+            trials, completed, stages = self._adaptive_trials(
+                prepared, spec, folds, trial_specs, cancelled, progress
             )
-        completed = [item for item in trials if item["status"] == "completed"]
+        else:
+            trials = []
+            for index, trial in enumerate(trial_specs):
+                self._check_cancelled(cancelled)
+                try:
+                    result = self._evaluate_trial(
+                        prepared, spec, folds, trial, cancelled
+                    )
+                except InterruptedError:
+                    raise
+                except Exception as exc:
+                    result = {
+                        **trial, "status": "failed",
+                        "error": str(exc), "score": -999.0,
+                    }
+                trials.append(result)
+                progress(
+                    0.20 + 0.78 * (index + 1) / max(1, len(trial_specs)),
+                    f"完成候选 {index + 1}/{len(trial_specs)}",
+                )
+            completed = [
+                item for item in trials if item["status"] == "completed"
+            ]
+            stages = [{
+                "stage": 1,
+                "candidates": len(trial_specs),
+                "survivors": len(completed),
+                "folds": spec.inner_folds,
+            }]
         if not completed:
             errors = [item.get("error", "未知错误") for item in trials[:3]]
             raise ValueError(f"所有搜索候选均失败: {errors}")
@@ -368,7 +486,184 @@ class AutoMLSearchEngine:
         return {
             "winner": winner, "trials": trials, "quality": quality,
             "clusters": clusters, "shortlist": shortlist, "warnings": [],
+            "stages": stages, "prefiltered": prefiltered,
         }
+
+    def _adaptive_trials(
+        self,
+        frame: pl.DataFrame,
+        spec: MLSearchSpec,
+        folds: list[InnerFold],
+        trial_specs: list[dict[str, Any]],
+        cancelled: threading.Event,
+        progress: ProgressCallback,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        survivor_second, survivor_final = self._stage_sizes(spec)[1:]
+        stage_plan = [
+            (1, min(survivor_second, len(trial_specs)), 400),
+            (min(2, len(folds)), min(survivor_final, len(trial_specs)), 800),
+            (len(folds), min(survivor_final, len(trial_specs)), None),
+        ]
+        public_results: dict[int, dict[str, Any]] = {}
+        candidates = list(trial_specs)
+        stages: list[dict[str, Any]] = []
+        expected = len(trial_specs) + stage_plan[0][1] + stage_plan[1][1]
+        completed_evaluations = 0
+        final_completed: list[dict[str, Any]] = []
+        for stage_index, (fold_count, survivor_count, estimator_cap) in enumerate(
+            stage_plan, start=1
+        ):
+            started = time.perf_counter()
+            stage_results: list[dict[str, Any]] = []
+            for trial in candidates:
+                self._check_cancelled(cancelled)
+                params = dict(trial["params"])
+                if estimator_cap is not None and "n_estimators" in params:
+                    params["n_estimators"] = min(
+                        int(params["n_estimators"]), estimator_cap
+                    )
+                evaluated_trial = {**trial, "params": params}
+                try:
+                    result = self._evaluate_trial(
+                        frame,
+                        spec,
+                        folds[:fold_count],
+                        evaluated_trial,
+                        cancelled,
+                    )
+                    result.update({
+                        "params": trial["params"],
+                        "stage_reached": stage_index,
+                        "folds_evaluated": fold_count,
+                    })
+                except InterruptedError:
+                    raise
+                except Exception as exc:
+                    result = {
+                        **trial,
+                        "status": "failed",
+                        "error": str(exc),
+                        "score": -999.0,
+                        "stage_reached": stage_index,
+                        "folds_evaluated": fold_count,
+                    }
+                stage_results.append(result)
+                public_results[trial["trial"]] = result
+                completed_evaluations += 1
+                progress(
+                    0.20 + 0.78 * completed_evaluations / max(1, expected),
+                    f"自适应阶段 {stage_index}/3 · 候选 "
+                    f"{len(stage_results)}/{len(candidates)}",
+                )
+            completed = [
+                item for item in stage_results if item["status"] == "completed"
+            ]
+            if not completed:
+                break
+            if stage_index == len(stage_plan):
+                final_completed = completed
+                retained = completed
+            else:
+                retained = self._retain_candidates(completed, survivor_count)
+                retained_ids = {item["trial"] for item in retained}
+                candidates = [
+                    item for item in trial_specs if item["trial"] in retained_ids
+                ]
+            stages.append({
+                "stage": stage_index,
+                "candidates": len(stage_results),
+                "completed": len(completed),
+                "survivors": len(retained),
+                "folds": fold_count,
+                "estimator_cap": estimator_cap,
+                "seconds": time.perf_counter() - started,
+            })
+        return (
+            [public_results[index] for index in sorted(public_results)],
+            final_completed,
+            stages,
+        )
+
+    @staticmethod
+    def _retain_candidates(
+        completed: list[dict[str, Any]], count: int
+    ) -> list[dict[str, Any]]:
+        ordered = sorted(
+            completed, key=lambda item: item.get("score", -999.0), reverse=True
+        )
+        selected: list[dict[str, Any]] = []
+        for algorithm in dict.fromkeys(item["algorithm"] for item in ordered):
+            baseline = next(
+                (
+                    item for item in ordered
+                    if item["algorithm"] == algorithm and item.get("baseline")
+                ),
+                None,
+            )
+            best = next(
+                item for item in ordered if item["algorithm"] == algorithm
+            )
+            preserved = baseline or best
+            if preserved not in selected:
+                selected.append(preserved)
+        for algorithm in dict.fromkeys(item["algorithm"] for item in ordered):
+            best = next(
+                item for item in ordered if item["algorithm"] == algorithm
+            )
+            if best not in selected:
+                selected.append(best)
+        for item in ordered:
+            if len(selected) >= count:
+                break
+            if item not in selected:
+                selected.append(item)
+        return selected[:count]
+
+    @staticmethod
+    def _prefilter_factors(
+        accepted: list[str],
+        quality: list[dict[str, Any]],
+        definitions: dict[str, Any],
+        required_order: list[str],
+        seed: int,
+        limit: int,
+    ) -> list[str]:
+        if len(accepted) <= limit:
+            return accepted
+        ranks = {
+            item["factor_id"]: float(item.get("selection_rank") or 0.0)
+            for item in quality
+        }
+        ranked = sorted(accepted, key=lambda name: ranks.get(name, 0.0), reverse=True)
+        selected = [name for name in required_order if name in accepted]
+        groups: dict[str, list[str]] = {}
+        for name in ranked:
+            groups.setdefault(definitions[name].family, []).append(name)
+        family_target = max(len(selected), int(limit * 0.60))
+        while len(selected) < family_target and any(groups.values()):
+            for family in sorted(groups):
+                if groups[family]:
+                    name = groups[family].pop(0)
+                    if name not in selected:
+                        selected.append(name)
+                        if len(selected) >= family_target:
+                            break
+        exploration = max(1, int(limit * 0.20))
+        quality_target = max(len(selected), limit - exploration)
+        for name in ranked:
+            if len(selected) >= quality_target:
+                break
+            if name not in selected:
+                selected.append(name)
+        remaining = [name for name in accepted if name not in selected]
+        rng = np.random.default_rng(seed)
+        if remaining:
+            order = rng.permutation(len(remaining))
+            for index in order:
+                if len(selected) >= limit:
+                    break
+                selected.append(remaining[int(index)])
+        return selected[:limit]
 
     def _evaluate_trial(
         self,
@@ -387,8 +682,12 @@ class AutoMLSearchEngine:
         for fold in folds:
             train = frame.filter(pl.col("date").is_in(fold.train_dates))
             validation = frame.filter(pl.col("date").is_in(fold.validation_dates))
-            valid_train = train.drop_nulls(trial["features"])
-            valid_validation = validation.drop_nulls(trial["features"])
+            valid_train = _finite_rows(
+                train, [*trial["features"], "target", "sample_weight"]
+            )
+            valid_validation = _finite_rows(
+                validation, [*trial["features"], "target"]
+            )
             coverage = valid_validation.height / max(1, validation.height)
             if coverage < 0.9:
                 raise ValueError(f"内层第 {fold.index + 1} 折覆盖率 {coverage:.1%} 低于 90%")
@@ -440,8 +739,16 @@ class AutoMLSearchEngine:
             standard_deviation = float(np.std(valid)) if len(valid) else 0.0
             median = float(np.median(valid)) if len(valid) else 0.0
             mad = float(np.median(np.abs(valid - median))) if len(valid) else 0.0
-            extreme_rate = float(np.mean(np.abs(valid - median) > 20 * mad)) \
-                if mad > 1e-12 else float(np.mean(np.abs(valid - median) > 1e-12))
+            if not len(valid):
+                extreme_rate = 0.0
+            elif mad > 1e-12:
+                extreme_rate = float(
+                    np.mean(np.abs(valid - median) > 20 * mad)
+                )
+            else:
+                extreme_rate = float(
+                    np.mean(np.abs(valid - median) > 1e-12)
+                )
             reason = None
             if coverage < 0.9:
                 reason = f"覆盖率 {coverage:.1%} 低于 90%"
@@ -499,16 +806,27 @@ class AutoMLSearchEngine:
             for column in range(values.shape[1]):
                 data = values[:, column]
                 finite = np.isfinite(data)
-                fill = float(np.nanmedian(data[finite])) if finite.any() else 0.0
+                fill = float(np.median(data[finite])) if finite.any() else 0.0
                 data = np.where(finite, data, fill)
-                order = np.argsort(data, kind="mergesort")
-                ranks = np.empty(len(data), dtype=float)
-                ranks[order] = np.arange(len(data), dtype=float)
-                ranked[:, column] = ranks
-            matrix = np.corrcoef(ranked, rowvar=False)
-            if matrix.shape == (len(factors), len(factors)):
-                matrices.append(matrix)
-        median = np.nanmedian(np.stack(matrices), axis=0) if matrices else np.eye(len(factors))
+                ranked[:, column] = rank_values(data)
+            centered = ranked - ranked.mean(axis=0)
+            norms = np.linalg.norm(centered, axis=0)
+            usable = norms > 1e-12
+            matrix = np.full((len(factors), len(factors)), np.nan)
+            if usable.any():
+                normalized = centered[:, usable] / norms[usable]
+                matrix[np.ix_(usable, usable)] = normalized.T @ normalized
+            matrices.append(matrix)
+        median = np.eye(len(factors))
+        if matrices:
+            stacked = np.stack(matrices)
+            for left in range(len(factors)):
+                for right in range(left + 1, len(factors)):
+                    values = stacked[:, left, right]
+                    finite = values[np.isfinite(values)]
+                    correlation = float(np.median(finite)) if len(finite) else 0.0
+                    median[left, right] = correlation
+                    median[right, left] = correlation
         parent = list(range(len(factors)))
 
         def find(index: int) -> int:
@@ -553,7 +871,6 @@ class AutoMLSearchEngine:
             return {}
         try:
             from sklearn.ensemble import ExtraTreesRegressor
-            from sklearn.impute import SimpleImputer
             from sklearn.inspection import permutation_importance
         except ImportError:
             return {name: 0.0 for name in factors}
@@ -570,9 +887,21 @@ class AutoMLSearchEngine:
 
         train = sample(train, 50_000)
         validation = sample(validation, 20_000)
-        imputer = SimpleImputer(strategy="median")
-        x_train = imputer.fit_transform(train.select(factors).to_numpy())
-        x_validation = imputer.transform(validation.select(factors).to_numpy())
+        train = _finite_rows(train, ["target", "sample_weight"])
+        validation = _finite_rows(validation, ["target"])
+        if train.is_empty() or validation.is_empty():
+            return {name: 0.0 for name in factors}
+        x_train = train.select(factors).to_numpy().astype(float)
+        x_validation = validation.select(factors).to_numpy().astype(float)
+        medians = np.array([
+            float(np.median(column[np.isfinite(column)]))
+            if np.isfinite(column).any() else 0.0
+            for column in x_train.T
+        ])
+        x_train = np.where(np.isfinite(x_train), x_train, medians)
+        x_validation = np.where(
+            np.isfinite(x_validation), x_validation, medians
+        )
         model = ExtraTreesRegressor(
             n_estimators=64, max_depth=4, min_samples_leaf=20,
             random_state=seed, n_jobs=max(1, (os.cpu_count() or 4) - 2),
@@ -635,7 +964,7 @@ class AutoMLSearchEngine:
                     }
                 elif algorithm == "lightgbm":
                     params = {
-                        "n_estimators": 800,
+                        "n_estimators": 2000,
                         "num_leaves": 31 if index == 0 else int(rng.choice([15, 31, 47, 63])),
                         "min_child_samples": 40 if index == 0 else int(rng.integers(20, 101)),
                         "reg_alpha": 0.1 if index == 0 else float(10 ** rng.uniform(-4, 0.3)),
@@ -643,7 +972,7 @@ class AutoMLSearchEngine:
                     }
                 else:
                     params = {
-                        "n_estimators": 800,
+                        "n_estimators": 2000,
                         "max_depth": 6 if index == 0 else int(rng.integers(3, 10)),
                         "min_child_weight": 5.0 if index == 0 else float(rng.uniform(1, 12)),
                         "reg_alpha": 0.1 if index == 0 else float(10 ** rng.uniform(-4, 0.3)),
@@ -652,12 +981,18 @@ class AutoMLSearchEngine:
                 result.append({
                     "trial": len(result), "algorithm": algorithm,
                     "features": selected, "params": params,
+                    "baseline": index == 0,
                 })
         return result
 
     def _trial_counts(self, spec: MLSearchSpec) -> dict[str, int]:
         base = _BUDGET_TRIALS[spec.budget]
         return {name: base[name] for name in dict.fromkeys(spec.algorithms)}
+
+    def _stage_sizes(self, spec: MLSearchSpec) -> tuple[int, int, int]:
+        total = sum(self._trial_counts(spec).values())
+        second, final = _ADAPTIVE_SURVIVORS[spec.budget]
+        return total, min(total, second), min(total, final)
 
     @staticmethod
     def _select_winner(completed: list[dict[str, Any]]) -> dict[str, Any]:
@@ -752,8 +1087,12 @@ class AutoMLSearchEngine:
         spec: MLSearchSpec, train: pl.DataFrame, validation: pl.DataFrame,
         cancelled: threading.Event,
     ):
-        train = train.drop_nulls(features)
-        validation = validation.drop_nulls(features)
+        train = _finite_rows(
+            train, [*features, "target", "sample_weight"]
+        )
+        validation = _finite_rows(
+            validation, [*features, "target"]
+        )
         if train.is_empty() or validation.is_empty():
             raise ValueError("完整特征训练或验证样本为空")
         lower, upper = train["target"].quantile(0.01), train["target"].quantile(0.99)
@@ -782,6 +1121,10 @@ class AutoMLSearchEngine:
             reason = None
             if spec.asset_type not in factor.asset_types:
                 reason = f"不支持资产类型 {spec.asset_type}"
+            elif not factor.enabled:
+                reason = "因子已禁用"
+            elif factor.compute_status != "ready":
+                reason = f"因子不可计算: {factor.blocked_reason or factor.compute_status}"
             elif factor.frequency != "1d":
                 reason = "智能训练第一阶段只支持日频因子"
             elif factor.authoring_type == "model":

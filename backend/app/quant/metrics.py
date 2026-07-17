@@ -8,18 +8,46 @@ import numpy as np
 import polars as pl
 
 
-def _rank(values: np.ndarray) -> np.ndarray:
+def rank_values(values: np.ndarray) -> np.ndarray:
+    """Return average ranks so constant and tied inputs stay constant."""
     order = np.argsort(values, kind="mergesort")
     ranked = np.empty(len(values), dtype=float)
-    ranked[order] = np.arange(len(values), dtype=float)
+    ordered = values[order]
+    start = 0
+    while start < len(values):
+        end = start + 1
+        while end < len(values) and ordered[end] == ordered[start]:
+            end += 1
+        ranked[order[start:end]] = (start + end - 1) / 2
+        start = end
     return ranked
+
+
+def spearman_correlation(left: np.ndarray, right: np.ndarray) -> float | None:
+    left = np.asarray(left, dtype=float)
+    right = np.asarray(right, dtype=float)
+    finite = np.isfinite(left) & np.isfinite(right)
+    if int(finite.sum()) < 3:
+        return None
+    left_rank = rank_values(left[finite])
+    right_rank = rank_values(right[finite])
+    left_centered = left_rank - left_rank.mean()
+    right_centered = right_rank - right_rank.mean()
+    denominator = float(np.linalg.norm(left_centered) * np.linalg.norm(right_centered))
+    if denominator <= 1e-12:
+        return None
+    correlation = float(left_centered @ right_centered / denominator)
+    return correlation if np.isfinite(correlation) else None
 
 
 def evaluate_oos(frame: pl.DataFrame) -> dict[str, Any]:
     required = {"date", "symbol", "target", "prediction"}
     if not required.issubset(frame.columns):
         raise ValueError(f"OOS 评价缺少列: {sorted(required - set(frame.columns))}")
-    valid = frame.filter(pl.col("target").is_not_null() & pl.col("prediction").is_not_null())
+    valid = frame.filter(
+        pl.col("target").cast(pl.Float64, strict=False).is_finite()
+        & pl.col("prediction").cast(pl.Float64, strict=False).is_finite()
+    )
     if valid.is_empty():
         raise ValueError("没有可评价的 OOS 预测")
     target = valid["target"].to_numpy().astype(float)
@@ -35,8 +63,8 @@ def evaluate_oos(frame: pl.DataFrame) -> dict[str, Any]:
             continue
         y = group["target"].to_numpy().astype(float)
         p = group["prediction"].to_numpy().astype(float)
-        ic = float(np.corrcoef(_rank(p), _rank(y))[0, 1])
-        if np.isfinite(ic):
+        ic = spearman_correlation(p, y)
+        if ic is not None:
             day = group["date"][0]
             daily_ic.append({"date": str(day), "ic": ic})
             yearly[day.year].append(ic)

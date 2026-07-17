@@ -11,8 +11,16 @@ from typing import Any, ClassVar
 import polars as pl
 
 from app.quant.models import FactorDefinition
+from app.quant.standard_expression import (
+    DEFAULT_LIBRARY_DIR,
+    ORIGIN as STANDARD_EXPRESSION_ORIGIN,
+    compile_standard_expression,
+    evaluate_standard_expression,
+    import_standard_expression_library,
+    standard_expression_asset_types,
+)
 
-BUILTIN_FACTORS: list[dict[str, str]] = [
+BUILTIN_FACTORS: list[dict[str, Any]] = [
     {"id": "momentum_5d", "name": "5日动量", "group": "动量", "description": "5日涨跌幅"},
     {"id": "momentum_10d", "name": "10日动量", "group": "动量", "description": "10日涨跌幅"},
     {"id": "momentum_20d", "name": "20日动量", "group": "动量", "description": "20日涨跌幅"},
@@ -24,7 +32,13 @@ BUILTIN_FACTORS: list[dict[str, str]] = [
     {"id": "annual_vol_20d", "name": "20日波动率", "group": "波动率", "description": "20日年化波动率"},
     {"id": "atr_14", "name": "ATR(14)", "group": "波动率", "description": "14日平均真实波幅"},
     {"id": "vol_ratio_5d", "name": "量比(5日)", "group": "量价", "description": "成交量与5日均量之比"},
-    {"id": "turnover_rate", "name": "换手率", "group": "量价", "description": "当日换手率"},
+    {
+        "id": "turnover_rate",
+        "name": "换手率",
+        "group": "量价",
+        "description": "当日换手率",
+        "asset_types": ["stock"],
+    },
     {"id": "macd_hist", "name": "MACD柱", "group": "趋势", "description": "MACD柱状图"},
     {"id": "kdj_k", "name": "KDJ-K", "group": "趋势", "description": "KDJ K值"},
     {"id": "change_pct", "name": "日涨跌幅", "group": "基础", "description": "当日涨跌幅"},
@@ -35,6 +49,14 @@ BUILTIN_FACTORS: list[dict[str, str]] = [
 def _digest(value: Any) -> str:
     raw = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _definition_digest_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """因子版本只跟计算语义相关,不跟启停/标签等管理状态绑定。"""
+    ignored = {
+        "version", "enabled", "tags", "blocked_reason", "compute_status",
+    }
+    return {key: value for key, value in payload.items() if key not in ignored}
 
 
 def builtin_factor_columns() -> list[dict[str, str]]:
@@ -121,6 +143,7 @@ class FactorRegistry:
         self.trust_path = self.base / "trusted_code.json"
         self.declarative_dir.mkdir(parents=True, exist_ok=True)
         self.code_dir.mkdir(parents=True, exist_ok=True)
+        self._migrate_standard_expression_assets()
 
     def list(self) -> list[FactorDefinition]:
         factors = [self._builtin(item) for item in BUILTIN_FACTORS]
@@ -150,11 +173,56 @@ class FactorRegistry:
     def upsert(self, definition: FactorDefinition) -> FactorDefinition:
         if definition.authoring_type != "declarative":
             raise ValueError("该接口只保存声明式因子")
-        FactorExpressionCompiler.compile(definition.expression or {}, set(definition.inputs))
+        if definition.origin == STANDARD_EXPRESSION_ORIGIN:
+            compile_standard_expression(definition.expression or {}, set(definition.inputs))
+        else:
+            FactorExpressionCompiler.compile(definition.expression or {}, set(definition.inputs))
         payload = definition.model_dump(mode="json")
-        payload["version"] = _digest({k: v for k, v in payload.items() if k != "version"})
+        payload["version"] = _digest(_definition_digest_payload(payload))
         saved = FactorDefinition.model_validate(payload)
         path = self.declarative_dir / f"{saved.id}.json"
+        path.write_text(saved.model_dump_json(indent=2), encoding="utf-8")
+        return saved
+
+    def import_standard_expression(
+        self,
+        root: Path | str | None = None,
+        *,
+        dry_run: bool = True,
+    ) -> dict[str, Any]:
+        source_root = Path(root) if root else DEFAULT_LIBRARY_DIR
+        stats = import_standard_expression_library(source_root, dry_run=dry_run)
+        definitions: list[FactorDefinition] = stats.pop("factors")
+        stats["source_root"] = str(source_root)
+        if dry_run:
+            return stats
+        for definition in definitions:
+            path = self.declarative_dir / f"{definition.id}.json"
+            path.write_text(definition.model_dump_json(indent=2), encoding="utf-8")
+        stats["imported"] = len(definitions)
+        return stats
+
+    def update_state(
+        self,
+        factor_id: str,
+        *,
+        enabled: bool | None = None,
+        tags: list[str] | None = None,
+    ) -> FactorDefinition:
+        factor = self.get(factor_id)
+        if factor.readonly:
+            raise ValueError("只读因子不能修改状态")
+        path = self.declarative_dir / f"{factor_id}.json"
+        if not path.exists():
+            raise ValueError("仅支持管理声明式/标准表达式因子")
+        updates: dict[str, Any] = {}
+        if enabled is not None:
+            if enabled and factor.compute_status != "ready":
+                raise ValueError(f"因子不可计算,不能启用: {factor.blocked_reason or factor.compute_status}")
+            updates["enabled"] = enabled
+        if tags is not None:
+            updates["tags"] = tags
+        saved = factor.model_copy(update=updates)
         path.write_text(saved.model_dump_json(indent=2), encoding="utf-8")
         return saved
 
@@ -203,12 +271,19 @@ class FactorRegistry:
         return self.get(factor_id)
 
     def evaluate(self, df: pl.DataFrame, factor: FactorDefinition) -> pl.DataFrame:
+        if not factor.enabled:
+            raise ValueError(f"因子 {factor.id} 已禁用")
+        if factor.compute_status != "ready":
+            raise ValueError(f"因子 {factor.id} 不可计算: {factor.blocked_reason or factor.compute_status}")
         if factor.authoring_type == "builtin":
             if factor.id not in df.columns:
                 raise ValueError(f"数据面板缺少内置因子列: {factor.id}")
             return df
         if factor.authoring_type == "declarative":
-            expr = FactorExpressionCompiler.compile(factor.expression or {}, set(df.columns))
+            if factor.origin == STANDARD_EXPRESSION_ORIGIN:
+                return evaluate_standard_expression(df, factor.expression or {}, output_name=factor.id)
+            else:
+                expr = FactorExpressionCompiler.compile(factor.expression or {}, set(df.columns))
             return df.with_columns(expr.cast(pl.Float64, strict=False).alias(factor.id))
         if factor.authoring_type == "python":
             if not factor.trusted:
@@ -246,7 +321,27 @@ class FactorRegistry:
             family=item["group"],
             version=_digest(item), authoring_type="builtin", readonly=True,
             inputs=[item["id"]], expression=None, trusted=True,
+            enabled=True, origin="builtin", library_name="系统内置",
+            admission_status="builtin", compute_status="ready",
+            asset_types=item.get("asset_types", ["stock", "etf"]),
         )
+
+    def _migrate_standard_expression_assets(self) -> None:
+        """Refresh asset metadata without changing expression-derived versions."""
+        for path in self.declarative_dir.glob("*.json"):
+            try:
+                factor = FactorDefinition.model_validate_json(
+                    path.read_text(encoding="utf-8")
+                )
+                if factor.origin != STANDARD_EXPRESSION_ORIGIN:
+                    continue
+                asset_types = standard_expression_asset_types(factor.raw_fields)
+                if factor.asset_types == asset_types:
+                    continue
+                updated = factor.model_copy(update={"asset_types": asset_types})
+                path.write_text(updated.model_dump_json(indent=2), encoding="utf-8")
+            except Exception:
+                continue
 
     def _trust_map(self) -> dict[str, str]:
         if not self.trust_path.exists():
@@ -295,6 +390,8 @@ class FactorRegistry:
                     inputs=payload.get("schema", {}).get("features", []),
                     params={"model_version": version}, expression=None,
                     asset_types=[payload["spec"]["asset_type"]],
+                    enabled=True, origin="model", library_name="模型中心",
+                    admission_status="published", compute_status="ready",
                 ))
             except Exception:
                 continue

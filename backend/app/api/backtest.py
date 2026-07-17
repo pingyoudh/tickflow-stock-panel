@@ -131,8 +131,24 @@ class FactorColumnsResponse(BaseModel):
 @router.get("/factor/columns")
 def factor_columns():
     """返回可用的因子列列表。"""
-    from app.backtest.factor import FACTOR_COLUMNS
-    return {"columns": FACTOR_COLUMNS}
+    from app.quant.factors import FactorRegistry
+
+    registry = FactorRegistry(settings.data_dir)
+    columns = []
+    for factor in registry.list():
+        if (
+            factor.enabled
+            and factor.compute_status == "ready"
+            and factor.authoring_type != "model"
+            and "stock" in factor.asset_types
+        ):
+            columns.append({
+                "id": factor.id,
+                "label": factor.name,
+                "group": factor.family,
+                "desc": factor.description,
+            })
+    return {"columns": columns}
 
 
 class FactorBacktestRequest(BaseModel):
@@ -152,9 +168,10 @@ class FactorBacktestRequest(BaseModel):
 def factor_run(req: FactorBacktestRequest, request: Request):
     """因子回测 — IC/IR 分析 + 分层回测。"""
     from app.backtest.factor import FactorBacktestService, FactorConfig
+    from app.quant.factors import FactorRegistry
 
     engine = _get_engine(request)
-    svc = FactorBacktestService(engine)
+    svc = FactorBacktestService(engine, FactorRegistry(settings.data_dir))
 
     end = req.end or date.today()
     start = _resolve_start(req, end, STRATEGY_DEFAULT_DAYS)

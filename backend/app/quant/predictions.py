@@ -1,6 +1,8 @@
 """Post-close predictions for explicitly published immutable models."""
 from __future__ import annotations
 
+import logging
+import time
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -13,6 +15,8 @@ from app.quant.dataset import MLDatasetBuilder
 from app.quant.model_registry import ModelRegistry
 from app.quant.models import ModelSpec
 
+logger = logging.getLogger(__name__)
+
 
 class PredictionService:
     def __init__(self, data_dir: Path, models: ModelRegistry, datasets: MLDatasetBuilder) -> None:
@@ -21,6 +25,7 @@ class PredictionService:
         self.datasets = datasets
 
     def generate(self, version: str, as_of: date | None = None) -> dict[str, Any]:
+        started = time.perf_counter()
         metadata = self.models.get(version)
         if metadata["status"] != "published":
             raise ValueError("只有手动发布的模型才能生成盘后预测")
@@ -29,7 +34,17 @@ class PredictionService:
         if target_date <= spec.start:
             raise ValueError("预测日期必须晚于训练开始日期")
         spec = spec.model_copy(update={"end": target_date})
+        logger.info(
+            "prediction generate start: version=%s algorithm=%s features=%d target=%s",
+            version, metadata["algorithm"], len(spec.features), target_date,
+        )
         frame = self.datasets.build_latest_features(spec)
+        logger.info(
+            "prediction feature panel ready: version=%s rows=%d columns=%d latest=%s elapsed=%.2fs",
+            version, frame.height, len(frame.columns),
+            frame["date"].max() if not frame.is_empty() and "date" in frame.columns else None,
+            time.perf_counter() - started,
+        )
         if frame.is_empty():
             raise ValueError("预测日期没有可用特征")
         schema_features = metadata["schema"]["features"]
@@ -50,7 +65,12 @@ class PredictionService:
         if valid.is_empty():
             raise ValueError("特征覆盖率不足, 没有生成预测; 不会复用旧分数")
         adapter = get_adapter(metadata["algorithm"])
+        logger.info(
+            "prediction model load start: version=%s rows=%d valid_rows=%d elapsed=%.2fs",
+            version, frame.height, valid.height, time.perf_counter() - started,
+        )
         model = adapter.load(self.models.model_path(version))
+        logger.info("prediction inference start: version=%s elapsed=%.2fs", version, time.perf_counter() - started)
         prediction = adapter.predict(model, valid.select(schema_features).to_numpy())
         output = valid.select(["symbol", "date", "feature_coverage"]).with_columns(
             pl.lit(version).alias("model_version"), pl.Series("prediction", prediction)
@@ -61,6 +81,10 @@ class PredictionService:
         directory = self.root / version / f"date={output_date}"
         directory.mkdir(parents=True, exist_ok=True)
         output.write_parquet(directory / "part.parquet")
+        logger.info(
+            "prediction generate done: version=%s date=%s rows=%d elapsed=%.2fs",
+            version, output_date, output.height, time.perf_counter() - started,
+        )
         psi = self._psi(prediction, metadata.get("training", {}).get("reference_prediction_quantiles"))
         warnings = ["预测分布 PSI 超过 0.25"] if psi is not None and psi > 0.25 else []
         return {

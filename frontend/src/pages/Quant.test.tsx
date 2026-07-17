@@ -9,26 +9,38 @@ const mocks = vi.hoisted(() => ({
   search: vi.fn(),
   searchEstimate: vi.fn(),
   factors: vi.fn(),
+  factorCache: vi.fn(),
+  clearFactorCache: vi.fn(),
   capabilities: vi.fn(),
   experiments: vi.fn(),
   models: vi.fn(),
   modelDetail: vi.fn(),
   modelBacktest: vi.fn(),
   modelPredictions: vi.fn(),
+  modelDeletionImpact: vi.fn(),
+  deleteModel: vi.fn(),
   strategies: vi.fn(),
+  importStandardExpressionFactors: vi.fn(),
+  updateFactorState: vi.fn(),
 }))
 
 vi.mock('@/lib/api', () => ({
   api: {
     quantFactors: mocks.factors,
     quantMLCapabilities: mocks.capabilities,
+    quantFactorCache: mocks.factorCache,
+    quantClearFactorCache: mocks.clearFactorCache,
     quantExperiments: mocks.experiments,
     quantModels: mocks.models,
     quantModelDetail: mocks.modelDetail,
     quantModelBacktest: mocks.modelBacktest,
     quantModelPredictions: mocks.modelPredictions,
+    quantModelDeletionImpact: mocks.modelDeletionImpact,
+    quantDeleteModel: mocks.deleteModel,
     quantPredictionDates: vi.fn(),
     quantStrategies: mocks.strategies,
+    quantImportStandardExpressionFactors: mocks.importStandardExpressionFactors,
+    quantUpdateFactorState: mocks.updateFactorState,
     quantTrain: mocks.train,
     quantSearch: mocks.search,
     quantSearchEstimate: mocks.searchEstimate,
@@ -59,7 +71,7 @@ const factors = [
   },
   {
     id: 'turnover_rate', name: '换手率', description: '当日换手', family: '量价', version: 'factor-v1',
-    authoring_type: 'builtin', asset_types: ['stock', 'etf'], trusted: true, readonly: true, point_in_time: true,
+    authoring_type: 'builtin', asset_types: ['stock'], trusted: true, readonly: true, point_in_time: true,
   },
 ]
 
@@ -84,14 +96,43 @@ describe('Quant workspace', () => {
       optuna: { installed: true, version: '4.9.0' },
       joblib: { installed: true, version: '1.5.3' },
     })
+    mocks.factorCache.mockResolvedValue({
+      max_bytes: 10 * 1024 ** 3, used_bytes: 1024 ** 3, used_ratio: 0.1,
+      entries: 12, active_entries: 0, oldest_accessed_at: null,
+    })
+    mocks.clearFactorCache.mockResolvedValue({
+      cleared: true, entries_removed: 12, bytes_removed: 1024 ** 3,
+    })
     mocks.experiments.mockResolvedValue({ experiments: [] })
     mocks.models.mockResolvedValue({ models: [] })
     mocks.modelDetail.mockResolvedValue(null)
     mocks.modelBacktest.mockResolvedValue({ run_id: 'backtest-1', status: 'queued' })
     mocks.modelPredictions.mockResolvedValue({ predictions: [], total: 0, date: null, summary: null })
+    mocks.modelDeletionImpact.mockResolvedValue({
+      model_version: 'model-v1', model_name: '模型', status: 'archived',
+      source_run_id: 'run-1', model_factor_id: 'ml_model',
+      experiments: [], strategies: [], prediction_files: 0, prediction_rows: 0,
+      total_bytes: 1024, active_blockers: [], can_delete: true,
+    })
+    mocks.deleteModel.mockResolvedValue({ deleted: true, model_version: 'model-v1' })
     mocks.strategies.mockResolvedValue({ strategies: [] })
     mocks.train.mockResolvedValue({ run_id: 'run-1', status: 'queued' })
     mocks.search.mockResolvedValue({ run_id: 'search-1', status: 'queued' })
+    mocks.importStandardExpressionFactors.mockResolvedValue({
+      library_name: '标准表达式因子库',
+      origin: 'standard_expression',
+      source_root: String.raw`C:\Users\dzzz\OneDrive\Desktop\AAA`,
+      source_rows: 1439,
+      unique_expressions: 1439,
+      admission_status: { admitted: 214, unscreened: 1122, rejected: 103 },
+      compute_status: { ready: 1290, blocked: 149 },
+      enabled: 178,
+      blocked: 149,
+      missing_fields: {},
+      unsupported_operators: {},
+      preview: [],
+    })
+    mocks.updateFactorState.mockResolvedValue({})
     mocks.searchEstimate.mockResolvedValue({
       estimated_rows: 100_000, factor_count: 4, outer_folds: 3,
       search_trials_per_window: 72, estimated_model_fits: 868,
@@ -132,18 +173,47 @@ describe('Quant workspace', () => {
     expect(spec.factor_pool).toEqual(factors.map(item => ({ id: item.id, version: item.version })))
     expect(spec.algorithms).toEqual(['elastic_net', 'lightgbm', 'xgboost'])
     expect(spec.budget).toBe('standard')
+    expect(spec.search_strategy).toBe('adaptive')
     expect(spec.inner_folds).toBe(3)
     expect(spec.inner_validation_days).toBe(63)
     expect(spec.walk_forward).toEqual({ train_days: 756, validation_days: 126, test_days: 126, step_days: 126 })
   })
 
+  it('uses ETF factors, cross-section target, and all-market filters', async () => {
+    const user = userEvent.setup()
+    renderQuant()
+    const assetButtons = await screen.findAllByRole('button', { name: 'ETF' })
+    await user.click(assetButtons.at(-1)!)
+    const startButtons = screen.getAllByRole('button', { name: /开始智能训练/ })
+    await user.click(startButtons.at(-1)!)
+    await waitFor(() => expect(mocks.search).toHaveBeenCalledOnce())
+    const spec = mocks.search.mock.calls[0][0]
+    expect(spec.asset_type).toBe('etf')
+    expect(spec.target).toEqual({
+      horizon: 5, benchmark_mode: 'cross_section_mean', benchmark_symbol: null,
+    })
+    expect(spec.factor_pool.map((item: { id: string }) => item.id)).toEqual([
+      'momentum_20d', 'annual_vol_20d', 'rsi_14',
+    ])
+    expect(spec.universe_filters).toEqual({
+      min_history_days: 120, min_median_amount_20d: 10_000_000,
+    })
+  })
+
   it('opens model diagnostics and starts an OOS backtest', async () => {
+    const expressionFeature = {
+      id: 'expr_factor_30531ad8e740cafe', name: '短期反转强度', description: '短期收益反转',
+      family: '反转', version: 'expression-v1', authoring_type: 'declarative',
+      asset_types: ['stock', 'etf'], trusted: true, readonly: false, point_in_time: true,
+      source_expression: 'Mul(-1, Mean($close / Delay($close, 1) - 1, 5))',
+    }
+    mocks.factors.mockResolvedValue({ factors: [...factors, expressionFeature] })
     const model = {
       version: 'model-v1', model_id: 'model_1', name: 'A股收益模型', algorithm: 'xgboost',
       status: 'published', created_at: '2026-07-16T00:00:00', published_at: '2026-07-16T01:00:00',
       spec: {
         id: 'model_1', name: 'A股收益模型', algorithm: 'xgboost', asset_type: 'stock', symbols: null,
-        features: ['momentum_20d'], start: '2021-01-01', end: '2026-07-16',
+        features: [expressionFeature.id], start: '2021-01-01', end: '2026-07-16',
         target: { horizon: 5, benchmark_mode: 'index', benchmark_symbol: '000300.SH' },
         walk_forward: { train_days: 756, validation_days: 126, test_days: 126, step_days: 126 },
         tuning: { enabled: false, max_trials: 20 }, device: 'auto', params: {}, seed: 42,
@@ -176,7 +246,12 @@ describe('Quant workspace', () => {
       },
     })
     mocks.modelDetail.mockResolvedValue({
-      ...model, training_run: { result: { metrics: { daily_ic: [] }, folds: [], feature_importance: {} } },
+      ...model, training_run: {
+        result: {
+          metrics: { daily_ic: [] }, folds: [],
+          feature_importance: { [expressionFeature.id]: { gain: 0.000123, split: 17 } },
+        },
+      },
       backtests: [], latest_backtest: null,
       prediction_dates: [{
         date: '2026-07-16', rows: 1, coverage: 1, prediction_min: 0.018,
@@ -188,6 +263,10 @@ describe('Quant workspace', () => {
     const modelCenterButtons = await screen.findAllByRole('button', { name: '模型中心' })
     await user.click(modelCenterButtons.at(-1)!)
     expect((await screen.findAllByText('A股收益模型')).length).toBeGreaterThan(0)
+    expect(await screen.findByText('短期反转强度')).toBeInTheDocument()
+    expect(screen.getByText(expressionFeature.id)).toBeInTheDocument()
+    expect(screen.getByText(expressionFeature.source_expression)).toBeInTheDocument()
+    expect(screen.getByText('Split 17')).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: '组合回测' }))
     await user.click(await screen.findByRole('button', { name: /运行严格 OOS 回测/ }))
     await waitFor(() => expect(mocks.modelBacktest).toHaveBeenCalledOnce())
@@ -230,5 +309,59 @@ describe('Quant workspace', () => {
     expect(await screen.findByText('因子漏斗明细')).toBeInTheDocument()
     expect(screen.getAllByText('elastic_net').length).toBeGreaterThan(0)
     expect(screen.getByText('通过质量筛选')).toBeInTheDocument()
+  })
+
+  it('requires the model suffix before permanent cascade deletion', async () => {
+    const version = 'delete-model-version-12345678'
+    const model = {
+      version, model_id: 'delete_model', name: '待删除模型', algorithm: 'elastic_net',
+      status: 'archived', created_at: '2026-07-16T00:00:00', published_at: null,
+      spec: {
+        id: 'delete_model', name: '待删除模型', algorithm: 'elastic_net',
+        asset_type: 'etf', symbols: null, features: ['momentum_20d'],
+        start: '2021-01-01', end: '2026-07-16',
+        target: { horizon: 5, benchmark_mode: 'cross_section_mean', benchmark_symbol: null },
+        walk_forward: { train_days: 756, validation_days: 126, test_days: 126, step_days: 126 },
+        tuning: { enabled: false, max_trials: 20 }, device: 'cpu', params: {},
+        seed: 42, universe_filters: {},
+      },
+      metrics: { rank_ic: 0.02 },
+      training: { actual_devices: ['cpu'], library_versions: ['1.8'], training_seconds: 1, warnings: [] },
+      diagnostic: {
+        grade: 'candidate', publish_warning: false, warnings: [],
+        dimensions: {
+          data: { status: 'green', reason: '数据完整' },
+          statistics: { status: 'yellow', reason: '轻微预测力' },
+          stability: { status: 'yellow', reason: '仍需观察' },
+          economics: { status: 'yellow', reason: '回测为正' },
+        },
+      },
+      latest_backtest: null, latest_prediction: null,
+    }
+    mocks.models.mockResolvedValue({ models: [model] })
+    mocks.modelDetail.mockResolvedValue({
+      ...model, training_run: null, backtests: [], latest_backtest: null,
+      prediction_dates: [],
+    })
+    mocks.modelDeletionImpact.mockResolvedValue({
+      model_version: version, model_name: model.name, status: 'archived',
+      source_run_id: 'run-1', model_factor_id: 'ml_delete',
+      experiments: [{ run_id: 'run-1', kind: 'ml_search', status: 'completed', name: '智能训练' }],
+      strategies: [], prediction_files: 1, prediction_rows: 200,
+      total_bytes: 2048, active_blockers: [], can_delete: true,
+    })
+    const user = userEvent.setup()
+    renderQuant()
+    const centerButtons = await screen.findAllByRole('button', { name: '模型中心' })
+    await user.click(centerButtons.at(-1)!)
+    const deleteButtons = await screen.findAllByTitle('永久级联删除模型')
+    await user.click(deleteButtons.at(-1)!)
+    const confirm = await screen.findByPlaceholderText('12345678')
+    const permanent = screen.getByRole('button', { name: /永久删除/ })
+    expect(permanent).toBeDisabled()
+    await user.type(confirm, '12345678')
+    expect(permanent).toBeEnabled()
+    await user.click(permanent)
+    await waitFor(() => expect(mocks.deleteModel).toHaveBeenCalledWith(version, version))
   })
 })

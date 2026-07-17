@@ -1,16 +1,20 @@
 """Persistent local experiments and cancellable background execution."""
 from __future__ import annotations
 
+import logging
 import shutil
 import threading
+import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from app.quant.models import ExperimentManifest, MLBacktestSpec, MLSearchSpec, ModelSpec
 from app.quant.trainer import MLTrainer
+
+logger = logging.getLogger(__name__)
 
 
 class ExperimentStore:
@@ -35,9 +39,25 @@ class ExperimentStore:
         manifest.updated_at = datetime.now()
         path = self.root / manifest.run_id / "manifest.json"
         with self._lock:
-            temp = path.with_suffix(".tmp")
-            temp.write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
-            temp.replace(path)
+            temp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+            try:
+                temp.write_text(
+                    manifest.model_dump_json(indent=2), encoding="utf-8"
+                )
+                self._replace_with_retry(temp, path)
+            finally:
+                temp.unlink(missing_ok=True)
+
+    @staticmethod
+    def _replace_with_retry(source: Path, target: Path) -> None:
+        for attempt in range(20):
+            try:
+                source.replace(target)
+                return
+            except PermissionError:
+                if attempt == 19:
+                    raise
+                time.sleep(0.025)
 
     def list(self) -> list[ExperimentManifest]:
         result = []
@@ -76,7 +96,8 @@ class ExperimentManager:
         manifest = self.store.create("ml_training", spec.model_dump(mode="json"))
         event = threading.Event()
         self._cancel[manifest.run_id] = event
-        self._futures[manifest.run_id] = self.executor.submit(
+        self._submit(
+            manifest.run_id,
             self._execute_ml, manifest.run_id, spec, event
         )
         return manifest
@@ -87,7 +108,8 @@ class ExperimentManager:
         manifest = self.store.create("ml_backtest", spec.model_dump(mode="json"))
         event = threading.Event()
         self._cancel[manifest.run_id] = event
-        self._futures[manifest.run_id] = self.executor.submit(
+        self._submit(
+            manifest.run_id,
             self._execute_backtest, manifest.run_id, spec, event
         )
         return manifest
@@ -98,7 +120,8 @@ class ExperimentManager:
         manifest = self.store.create("ml_search", spec.model_dump(mode="json"))
         event = threading.Event()
         self._cancel[manifest.run_id] = event
-        self._futures[manifest.run_id] = self.executor.submit(
+        self._submit(
+            manifest.run_id,
             self._execute_search, manifest.run_id, spec, event
         )
         return manifest
@@ -109,7 +132,13 @@ class ExperimentManager:
             return manifest
         event = self._cancel.setdefault(run_id, threading.Event())
         future = self._futures.get(run_id)
-        if manifest.status == "queued" and future is not None and future.cancel():
+        event.set()
+        if future is None or future.done():
+            manifest.status = "cancelled"
+            manifest.message = "后台任务已结束, 状态已清理"
+            self._cancel.pop(run_id, None)
+            self._futures.pop(run_id, None)
+        elif manifest.status == "queued" and future.cancel():
             manifest.status = "cancelled"
             manifest.message = "训练已取消"
             self._cancel.pop(run_id, None)
@@ -118,8 +147,46 @@ class ExperimentManager:
             manifest.status = "cancelling"
             manifest.message = "正在停止当前计算"
         self.store.save(manifest)
-        event.set()
         return manifest
+
+    def _submit(self, run_id: str, function, *args) -> None:
+        future = self.executor.submit(function, *args)
+        self._futures[run_id] = future
+        future.add_done_callback(
+            lambda completed, current_run_id=run_id: self._on_future_done(
+                current_run_id, completed
+            )
+        )
+
+    def _on_future_done(self, run_id: str, future: Future) -> None:
+        try:
+            try:
+                error = future.exception()
+            except CancelledError:
+                error = None
+            manifest = self.store.get(run_id)
+            if manifest.status in {"queued", "running", "cancelling"}:
+                if future.cancelled() or self._cancel.get(run_id, threading.Event()).is_set():
+                    manifest.status = "cancelled"
+                    manifest.message = "后台任务已停止"
+                else:
+                    manifest.status = "failed"
+                    manifest.message = "后台任务异常终止"
+                    manifest.error = self._format_error(error) if error else (
+                        "后台线程已结束, 但任务未写入完成状态"
+                    )
+                self.store.save(manifest)
+        except BaseException:
+            logger.exception("无法回收量化后台任务 run_id=%s", run_id)
+        finally:
+            self._cancel.pop(run_id, None)
+            self._futures.pop(run_id, None)
+
+    @staticmethod
+    def _format_error(exc: BaseException | None) -> str:
+        if exc is None:
+            return "未知后台异常"
+        return f"{type(exc).__name__}: {exc}"
 
     def rerun(self, run_id: str) -> ExperimentManifest:
         source = self.store.get(run_id)
@@ -163,18 +230,16 @@ class ExperimentManager:
             manifest = self.store.get(run_id)
             manifest.status = "cancelled"
             manifest.message = str(exc)
-        except Exception as exc:
+        except BaseException as exc:
             manifest = self.store.get(run_id)
             manifest.status = "failed"
-            manifest.error = str(exc)
+            manifest.error = self._format_error(exc)
             manifest.message = "训练失败"
         finally:
             if cancelled.is_set():
                 manifest.status = "cancelled"
                 manifest.message = "训练已取消"
             self.store.save(manifest)
-            self._cancel.pop(run_id, None)
-            self._futures.pop(run_id, None)
 
     def _execute_backtest(
         self, run_id: str, spec: MLBacktestSpec, cancelled: threading.Event
@@ -213,18 +278,16 @@ class ExperimentManager:
             manifest = self.store.get(run_id)
             manifest.status = "cancelled"
             manifest.message = str(exc)
-        except Exception as exc:
+        except BaseException as exc:
             manifest = self.store.get(run_id)
             manifest.status = "failed"
-            manifest.error = str(exc)
+            manifest.error = self._format_error(exc)
             manifest.message = "OOS 组合回测失败"
         finally:
             if cancelled.is_set():
                 manifest.status = "cancelled"
                 manifest.message = "回测已取消"
             self.store.save(manifest)
-            self._cancel.pop(run_id, None)
-            self._futures.pop(run_id, None)
 
     def _execute_search(
         self, run_id: str, spec: MLSearchSpec, cancelled: threading.Event
@@ -263,18 +326,20 @@ class ExperimentManager:
             manifest = self.store.get(run_id)
             manifest.status = "cancelled"
             manifest.message = str(exc)
-        except Exception as exc:
+        except BaseException as exc:
             manifest = self.store.get(run_id)
             manifest.status = "failed"
-            manifest.error = str(exc)
+            manifest.error = self._format_error(exc)
             manifest.message = "智能训练失败"
         finally:
             if cancelled.is_set():
                 manifest.status = "cancelled"
                 manifest.message = "智能训练已取消"
+            try:
+                self.searcher.datasets.factor_cache.evict()
+            except BaseException as exc:
+                manifest.warnings.append(f"因子缓存淘汰失败: {exc}")
             self.store.save(manifest)
-            self._cancel.pop(run_id, None)
-            self._futures.pop(run_id, None)
 
     def _recover_interrupted(self) -> None:
         for manifest in self.store.list():

@@ -2,12 +2,12 @@ import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Archive, BarChart3, CheckCircle2, Download, Loader2, Play, RefreshCw,
-  Rocket, Search, SlidersHorizontal, TriangleAlert,
+  Rocket, Search, SlidersHorizontal, Trash2, TriangleAlert, X,
 } from 'lucide-react'
 import {
   api, type MLBacktestHolding, type MLBacktestSpec, type MLBacktestTrade,
   type MLDiagnostic, type MLEquityPoint, type MLPredictionRow,
-  type QuantModel, type QuantModelDetail,
+  type QuantFactor, type QuantModel, type QuantModelDetail,
 } from '@/lib/api'
 
 type DetailView = 'validation' | 'backtest' | 'predictions'
@@ -42,6 +42,18 @@ function pct(value: unknown, digits = 2) {
 function num(value: unknown, digits = 2) {
   const number = Number(value)
   return Number.isFinite(number) ? number.toFixed(digits) : '--'
+}
+
+function fileSize(value: number | undefined) {
+  if (!Number.isFinite(value)) return '--'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let amount = Number(value)
+  let index = 0
+  while (amount >= 1024 && index < units.length - 1) {
+    amount /= 1024
+    index += 1
+  }
+  return `${amount.toFixed(index < 2 ? 0 : 1)} ${units[index]}`
 }
 
 function Grade({ diagnostic }: { diagnostic?: MLDiagnostic }) {
@@ -119,13 +131,59 @@ function PredictionDistribution({ rows }: { rows: MLPredictionRow[] }) {
   </div>
 }
 
-function ValidationView({ detail }: { detail: QuantModelDetail }) {
+function FeatureImportanceTable({
+  importance,
+  factors,
+}: {
+  importance: [string, { gain: number; split: number }][]
+  factors: QuantFactor[]
+}) {
+  const factorMap = useMemo(() => new Map(factors.map(item => [item.id, item])), [factors])
+  const rows = useMemo(
+    () => [...importance].sort((left, right) => Number(right[1].gain) - Number(left[1].gain)),
+    [importance],
+  )
+  const maxGain = Math.max(1e-12, ...rows.map(([, item]) => Number(item.gain) || 0))
+  if (!rows.length) {
+    return <div className="border-y border-border bg-surface py-10 text-center text-xs text-muted">暂无特征重要性</div>
+  }
+  return <div className="border-y border-border bg-surface">
+    <div className="bg-elevated/50 px-3 py-2 text-[10px] text-muted">中文名称、完整因子代码与计算表达式</div>
+    {rows.map(([featureId, item]) => {
+      const factor = factorMap.get(featureId)
+      return <div key={featureId} className="grid gap-3 border-t border-border px-3 py-3 text-[11px] xl:grid-cols-[220px_minmax(0,1fr)]">
+        <div className="min-w-0">
+          <div className="font-medium text-foreground">{factor?.name || featureId}</div>
+          <div className="mt-1 text-[10px] text-muted">{factor?.family || '未登记因子'}</div>
+        </div>
+        <div className="min-w-0 space-y-2">
+          <div className="grid gap-x-3 gap-y-1 sm:grid-cols-[64px_minmax(0,1fr)]">
+            <span className="text-[10px] text-muted">因子代码</span>
+            <code className="block whitespace-normal break-all font-mono text-[10px] leading-4 text-secondary">{featureId}</code>
+            {factor?.source_expression && <>
+              <span className="text-[10px] text-muted">计算表达式</span>
+              <code className="block whitespace-pre-wrap break-words font-mono text-[10px] leading-4 text-muted">{factor.source_expression}</code>
+            </>}
+          </div>
+          <div className="flex items-center gap-3">
+            <div className="h-1.5 min-w-0 flex-1 bg-elevated" aria-label={`${factor?.name || featureId}相对重要性`}>
+              <div className="h-full bg-accent" style={{ width: `${Math.max(0, Number(item.gain) || 0) / maxGain * 100}%` }} />
+            </div>
+            <span className="shrink-0 font-mono text-[10px] text-muted">Gain {num(item.gain, 6)}</span>
+            <span className="w-16 shrink-0 text-right font-mono text-[10px] text-muted">Split {num(item.split, 0)}</span>
+          </div>
+        </div>
+      </div>
+    })}
+  </div>
+}
+
+function ValidationView({ detail, factors }: { detail: QuantModelDetail; factors: QuantFactor[] }) {
   const diagnostic = detail.diagnostic
   const result = detail.training_run?.result ?? {}
   const dailyIC = (result.metrics?.daily_ic ?? []) as { date: string; ic: number }[]
   const folds = (result.folds ?? []) as Record<string, any>[]
   const importance = Object.entries(result.feature_importance ?? {}) as [string, { gain: number; split: number }][]
-  const maxGain = Math.max(1e-12, ...importance.map(([, item]) => item.gain))
   return <div className="space-y-4">
     <div className="grid gap-px overflow-hidden border-y border-border bg-border md:grid-cols-4">
       {Object.entries(diagnostic.dimensions).map(([key, item]) => <div key={key} className="bg-surface p-3">
@@ -138,7 +196,7 @@ function ValidationView({ detail }: { detail: QuantModelDetail }) {
       <div className="border-y border-border bg-surface p-3"><div className="text-xs font-medium">每日 Rank IC</div><ICChart rows={dailyIC} /></div>
       <div className="overflow-x-auto border-y border-border bg-surface"><table className="w-full min-w-[500px] text-left text-[11px]"><thead className="bg-elevated/50 text-muted"><tr><th className="px-3 py-2 font-normal">测试折</th><th className="px-3 py-2 font-normal">区间</th><th className="px-3 py-2 font-normal">Rank IC</th><th className="px-3 py-2 font-normal">ICIR</th></tr></thead><tbody>{folds.map(item => <tr key={item.index} className="border-t border-border"><td className="px-3 py-2">Fold {item.index + 1}</td><td className="px-3 py-2 font-mono text-muted">{item.test_start} ~ {item.test_end}</td><td className="px-3 py-2 font-mono">{num(item.metrics?.rank_ic, 4)}</td><td className="px-3 py-2 font-mono">{num(item.metrics?.icir, 2)}</td></tr>)}</tbody></table></div>
     </div>
-    <div className="border-y border-border bg-surface p-3"><div className="mb-2 text-xs font-medium">特征重要性</div>{importance.map(([name, item]) => <div key={name} className="grid grid-cols-[120px_1fr_70px] items-center gap-3 border-t border-border py-2 text-[11px]"><span className="truncate font-mono">{name}</span><div className="h-1.5 bg-elevated"><div className="h-full bg-accent" style={{ width: `${item.gain / maxGain * 100}%` }} /></div><span className="text-right font-mono text-muted">{num(item.gain, 6)}</span></div>)}</div>
+    <div><div className="mb-2 text-xs font-medium">特征重要性</div><FeatureImportanceTable importance={importance} factors={factors} /></div>
   </div>
 }
 
@@ -257,12 +315,16 @@ function PredictionsView({ detail, onPortfolio }: { detail: QuantModelDetail; on
   </div>
 }
 
-export function ModelCenter({ models, onPortfolio }: { models: QuantModel[]; onPortfolio: (version: string) => void }) {
+export function ModelCenter({ models, factors, onPortfolio }: { models: QuantModel[]; factors: QuantFactor[]; onPortfolio: (version: string) => void }) {
   const queryClient = useQueryClient()
   const [selected, setSelected] = useState(models[0]?.version ?? '')
   const [view, setView] = useState<DetailView>('validation')
   const [compare, setCompare] = useState<string[]>([])
+  const [assetFilter, setAssetFilter] = useState<'all' | 'stock' | 'etf'>('all')
+  const [deleteVersion, setDeleteVersion] = useState('')
+  const [deleteConfirm, setDeleteConfirm] = useState('')
   const current = selected || models[0]?.version || ''
+  const visibleModels = models.filter(item => assetFilter === 'all' || item.spec.asset_type === assetFilter)
   const detail = useQuery({
     queryKey: ['quant', 'model', current], queryFn: () => api.quantModelDetail(current),
     enabled: Boolean(current),
@@ -278,25 +340,77 @@ export function ModelCenter({ models, onPortfolio }: { models: QuantModel[]; onP
       void queryClient.invalidateQueries({ queryKey: ['quant', 'model', current] })
     },
   })
+  const deletionImpact = useQuery({
+    queryKey: ['quant', 'model', deleteVersion, 'deletion-impact'],
+    queryFn: () => api.quantModelDeletionImpact(deleteVersion),
+    enabled: Boolean(deleteVersion),
+  })
+  const deletion = useMutation({
+    mutationFn: () => api.quantDeleteModel(deleteVersion, deleteVersion),
+    onSuccess: () => {
+      const remaining = models.filter(item => item.version !== deleteVersion)
+      setSelected(remaining[0]?.version ?? '')
+      setCompare(items => items.filter(item => item !== deleteVersion))
+      setDeleteVersion('')
+      setDeleteConfirm('')
+      void queryClient.invalidateQueries({ queryKey: ['quant', 'models'] })
+      void queryClient.invalidateQueries({ queryKey: ['quant', 'experiments'] })
+      void queryClient.invalidateQueries({ queryKey: ['quant', 'strategies'] })
+    },
+  })
+  const openDeletion = (version: string) => {
+    setDeleteVersion(version)
+    setDeleteConfirm('')
+    deletion.reset()
+  }
+  const closeDeletion = () => {
+    if (deletion.isPending) return
+    setDeleteVersion('')
+    setDeleteConfirm('')
+  }
   const toggleCompare = (version: string) => setCompare(items => items.includes(version) ? items.filter(item => item !== version) : items.length < 4 ? [...items, version] : items)
   const compared = useMemo(() => models.filter(item => compare.includes(item.version)), [models, compare])
   const model = detail.data
-  return <div className="grid gap-4 xl:grid-cols-[330px_1fr]">
+  return <><div className="grid gap-4 xl:grid-cols-[330px_1fr]">
     <aside className="min-w-0 border-y border-border bg-surface">
-      <div className="flex items-center justify-between border-b border-border px-3 py-2"><div className="text-xs font-medium">模型版本</div><span className="text-[10px] text-muted">对比 {compare.length}/4</span></div>
-      <div className="max-h-[calc(100vh-180px)] overflow-y-auto">{models.map(item => <button key={item.version} onClick={() => setSelected(item.version)} className={`block w-full border-b border-border px-3 py-3 text-left hover:bg-elevated ${current === item.version ? 'bg-elevated/70' : ''}`}><div className="flex items-center gap-2"><span className="min-w-0 flex-1 truncate text-xs font-medium">{item.name}</span><Grade diagnostic={item.diagnostic} /></div><div className="mt-1 truncate font-mono text-[9px] text-muted">{item.version}</div><div className="mt-2 flex items-center justify-between text-[10px] text-secondary"><span>IC {num(item.metrics.rank_ic, 4)}</span><label className="flex items-center gap-1" onClick={event => event.stopPropagation()}><input type="checkbox" checked={compare.includes(item.version)} onChange={() => toggleCompare(item.version)} />对比</label></div></button>)}{!models.length && <div className="py-12 text-center text-xs text-muted">暂无模型</div>}</div>
+      <div className="border-b border-border px-3 py-2"><div className="flex items-center justify-between"><div className="text-xs font-medium">模型版本</div><span className="text-[10px] text-muted">对比 {compare.length}/4</span></div><div className="mt-2 flex rounded-btn border border-border p-0.5">{(['all', 'stock', 'etf'] as const).map(item => <button key={item} className={`h-6 flex-1 text-[10px] ${assetFilter === item ? 'bg-accent text-white' : 'text-muted'}`} onClick={() => setAssetFilter(item)}>{item === 'all' ? '全部' : item === 'stock' ? 'A股' : 'ETF'}</button>)}</div></div>
+      <div className="max-h-[calc(100vh-220px)] overflow-y-auto">{visibleModels.map(item => <button key={item.version} onClick={() => setSelected(item.version)} className={`block w-full border-b border-border px-3 py-3 text-left hover:bg-elevated ${current === item.version ? 'bg-elevated/70' : ''}`}><div className="flex items-center gap-2"><span className="min-w-0 flex-1 truncate text-xs font-medium">{item.name}</span><span className="rounded border border-border px-1 py-0.5 text-[9px] text-muted">{item.spec.asset_type === 'etf' ? 'ETF' : 'A股'}</span><Grade diagnostic={item.diagnostic} /></div><div className="mt-1 truncate font-mono text-[9px] text-muted">{item.version}</div><div className="mt-2 flex items-center justify-between text-[10px] text-secondary"><span>IC {num(item.metrics.rank_ic, 4)}</span><label className="flex items-center gap-1" onClick={event => event.stopPropagation()}><input type="checkbox" checked={compare.includes(item.version)} onChange={() => toggleCompare(item.version)} />对比</label></div></button>)}{!visibleModels.length && <div className="py-12 text-center text-xs text-muted">当前筛选下暂无模型</div>}</div>
     </aside>
     <section className="min-w-0 space-y-4">
       {compared.length > 1 && <div className="overflow-x-auto border-y border-border bg-surface"><table className="w-full min-w-[720px] text-left text-[11px]"><thead className="bg-elevated/50 text-muted"><tr><th className="px-3 py-2 font-normal">模型</th><th className="px-3 py-2 font-normal">结论</th><th className="px-3 py-2 font-normal">Rank IC</th><th className="px-3 py-2 font-normal">净 Sharpe</th><th className="px-3 py-2 font-normal">最大回撤</th></tr></thead><tbody>{compared.map(item => <tr key={item.version} className="border-t border-border"><td className="px-3 py-2">{item.name}</td><td className="px-3 py-2"><Grade diagnostic={item.diagnostic} /></td><td className="px-3 py-2 font-mono">{num(item.metrics.rank_ic, 4)}</td><td className="px-3 py-2 font-mono">{num(item.latest_backtest?.metrics.sharpe)}</td><td className="px-3 py-2 font-mono">{pct(item.latest_backtest?.metrics.max_drawdown)}</td></tr>)}</tbody></table></div>}
       {detail.isLoading && <div className="flex justify-center py-24"><Loader2 className="h-5 w-5 animate-spin text-muted" /></div>}
       {detail.error && <div className="border-y border-danger/30 bg-danger/5 px-3 py-3 text-xs text-danger">{detail.error.message}</div>}
       {model && <>
-        <div className="flex flex-wrap items-center justify-between gap-3 border-y border-border bg-surface px-3 py-3"><div><div className="flex items-center gap-2"><h2 className="text-sm font-semibold">{model.name}</h2><Grade diagnostic={model.diagnostic} /><span className="text-[10px] text-muted">{model.status}</span></div><div className="mt-1 font-mono text-[10px] text-muted">{model.version}</div></div><div className="flex gap-1">{model.status === 'validated' && <button className={quietButton} disabled={lifecycle.isPending} onClick={() => lifecycle.mutate({ action: 'publish', model })}><Rocket className="h-3 w-3" />发布</button>}{model.status !== 'archived' && <button className={quietButton} disabled={lifecycle.isPending} onClick={() => lifecycle.mutate({ action: 'archive', model })}><Archive className="h-3 w-3" />归档</button>}</div></div>
+        <div className="flex flex-wrap items-center justify-between gap-3 border-y border-border bg-surface px-3 py-3"><div><div className="flex items-center gap-2"><h2 className="text-sm font-semibold">{model.name}</h2><span className="rounded border border-border px-1.5 py-0.5 text-[10px] text-muted">{model.spec.asset_type === 'etf' ? 'ETF' : 'A股'}</span><Grade diagnostic={model.diagnostic} /><span className="text-[10px] text-muted">{model.status}</span></div><div className="mt-1 font-mono text-[10px] text-muted">{model.version}</div></div><div className="flex gap-1">{model.status === 'validated' && <button className={quietButton} disabled={lifecycle.isPending} onClick={() => lifecycle.mutate({ action: 'publish', model })}><Rocket className="h-3 w-3" />发布</button>}{model.status !== 'archived' && <button className={quietButton} disabled={lifecycle.isPending} onClick={() => lifecycle.mutate({ action: 'archive', model })}><Archive className="h-3 w-3" />归档</button>}<button className={`${quietButton} text-danger`} title={model.status === 'published' ? '已发布模型必须先归档' : '永久级联删除模型'} onClick={() => openDeletion(model.version)}><Trash2 className="h-3 w-3" />删除</button></div></div>
         <div className="flex max-w-full overflow-x-auto border-b border-border">{DETAIL_TABS.map(({ id, label, icon: Icon }) => <button key={id} onClick={() => setView(id)} className={`inline-flex h-9 shrink-0 items-center gap-1.5 border-b-2 px-3 text-[11px] ${view === id ? 'border-accent text-foreground' : 'border-transparent text-muted'}`}><Icon className="h-3.5 w-3.5" />{label}</button>)}</div>
-        {view === 'validation' && <ValidationView detail={model} />}
+        {view === 'validation' && <ValidationView detail={model} factors={factors} />}
         {view === 'backtest' && <BacktestView detail={model} />}
         {view === 'predictions' && <PredictionsView detail={model} onPortfolio={onPortfolio} />}
       </>}
     </section>
   </div>
+  {deleteVersion && <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" role="dialog" aria-modal="true" aria-label="永久删除模型">
+    <div className="w-full max-w-xl border border-border bg-base shadow-2xl">
+      <div className="flex items-center justify-between border-b border-border px-4 py-3"><div><div className="text-sm font-semibold">永久删除模型</div><div className="mt-1 font-mono text-[10px] text-muted">{deleteVersion}</div></div><button className="inline-flex h-7 w-7 items-center justify-center text-muted hover:text-foreground" title="关闭" onClick={closeDeletion}><X className="h-4 w-4" /></button></div>
+      <div className="max-h-[70vh] space-y-3 overflow-y-auto p-4 text-xs">
+        {deletionImpact.isLoading && <div className="flex justify-center py-10"><Loader2 className="h-5 w-5 animate-spin text-muted" /></div>}
+        {deletionImpact.error && <div className="border-y border-danger/30 bg-danger/5 px-3 py-2 text-danger">{deletionImpact.error.message}</div>}
+        {deletionImpact.data && <><div className="border-y border-danger/30 bg-danger/5 px-3 py-2 text-danger">该操作不可恢复。模型文件、预测、关联实验和引用此模型的量化策略会一起删除。</div>
+          <div className="grid grid-cols-2 gap-px border-y border-border bg-border sm:grid-cols-4">{[
+            ['模型状态', deletionImpact.data.status],
+            ['关联实验', String(deletionImpact.data.experiments.length)],
+            ['依赖策略', String(deletionImpact.data.strategies.length)],
+            ['磁盘占用', fileSize(deletionImpact.data.total_bytes)],
+          ].map(([label, value]) => <div key={label} className="bg-surface p-3"><div className="text-[10px] text-muted">{label}</div><div className="mt-1 font-mono">{value}</div></div>)}</div>
+          <div className="border-y border-border bg-surface"><div className="border-b border-border px-3 py-2 text-[11px] font-medium">将删除的内容</div><div className="space-y-1 px-3 py-2 text-[11px] text-secondary"><div>盘后预测：{deletionImpact.data.prediction_rows ?? 0} 行，{deletionImpact.data.prediction_files} 个文件</div>{deletionImpact.data.experiments.map(item => <div key={item.run_id} className="font-mono">实验 {item.run_id} · {item.kind} · {item.status}</div>)}{deletionImpact.data.strategies.map(item => <div key={item.id}>策略 {item.name} <span className="font-mono text-muted">({item.id})</span></div>)}</div></div>
+          {deletionImpact.data.status === 'published' && <div className="border-y border-warning/30 bg-warning/5 px-3 py-2 text-warning">该模型仍处于已发布状态，请关闭弹窗并先执行“归档”。</div>}
+          {deletionImpact.data.active_blockers.length > 0 && <div className="border-y border-warning/30 bg-warning/5 px-3 py-2 text-warning">请先取消活动实验：{deletionImpact.data.active_blockers.map(item => item.run_id).join(', ')}</div>}
+          <label className="block text-[11px] text-muted">输入模型版本末 8 位确认<input className={`${inputClass} mt-1 font-mono`} value={deleteConfirm} onChange={event => setDeleteConfirm(event.target.value.trim())} placeholder={deleteVersion.slice(-8)} /></label>
+        </>}
+        {deletion.error && <div className="border-y border-danger/30 bg-danger/5 px-3 py-2 text-danger">{deletion.error.message}</div>}
+      </div>
+      <div className="flex justify-end gap-2 border-t border-border px-4 py-3"><button className={quietButton} disabled={deletion.isPending} onClick={closeDeletion}>取消</button><button className="inline-flex h-8 items-center gap-1.5 rounded-btn bg-danger px-3 text-xs font-medium text-white disabled:opacity-40" disabled={deletion.isPending || !deletionImpact.data?.can_delete || deleteConfirm !== deleteVersion.slice(-8)} onClick={() => deletion.mutate()}>{deletion.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}永久删除</button></div>
+    </div>
+  </div>}
+  </>
 }

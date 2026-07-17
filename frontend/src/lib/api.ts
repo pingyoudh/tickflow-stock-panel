@@ -903,6 +903,35 @@ export interface QuantFactor {
   trusted: boolean
   readonly: boolean
   point_in_time: boolean
+  enabled?: boolean
+  origin?: string
+  library_name?: string
+  admission_status?: string
+  compute_status?: string
+  blocked_reason?: string
+  source_expression?: string
+  source_file?: string
+  source_row?: string
+  tags?: string[]
+  operators?: string[]
+  raw_fields?: string[]
+  params?: Record<string, unknown>
+}
+
+export interface StandardExpressionImportResult {
+  library_name: string
+  origin: string
+  source_root: string
+  source_rows: number
+  unique_expressions: number
+  admission_status: Record<string, number>
+  compute_status: Record<string, number>
+  enabled: number
+  blocked: number
+  missing_fields: Record<string, number>
+  unsupported_operators: Record<string, number>
+  imported?: number
+  preview?: QuantFactor[]
 }
 
 export interface MLModelSpec {
@@ -944,6 +973,7 @@ export interface MLSearchSpec {
   excluded_factors: FactorRef[]
   algorithms: MLAlgorithm[]
   budget: 'quick' | 'standard' | 'overnight'
+  search_strategy?: 'adaptive' | 'exhaustive'
   min_features: number
   max_features: number
   shortlist_limit: number
@@ -968,7 +998,38 @@ export interface MLSearchEstimate {
   search_trials_per_window: number
   estimated_model_fits: number
   estimated_hours: number
+  search_stages?: number[]
+  factor_cache?: FactorCacheStatus & {
+    factor_hits: number
+    factor_misses: number
+    hit_ratio: number
+    bytes_present: number
+  }
   warnings: string[]
+}
+
+export interface FactorCacheStatus {
+  max_bytes: number
+  used_bytes: number
+  used_ratio: number
+  entries: number
+  active_entries: number
+  oldest_accessed_at: string | null
+}
+
+export interface ModelDeletionImpact {
+  model_version: string
+  model_name: string
+  status: QuantModel['status']
+  source_run_id: string | null
+  model_factor_id: string
+  experiments: { run_id: string; kind: string; status: string; name: string }[]
+  strategies: { id: string; name: string }[]
+  prediction_files: number
+  prediction_rows: number
+  total_bytes: number
+  active_blockers: { run_id: string; kind: string; status: string; name: string }[]
+  can_delete: boolean
 }
 
 export interface QuantExperiment {
@@ -1135,7 +1196,21 @@ export const api = {
   health: () => request<{ status: string; version: string; mode: string }>('/health'),
 
   quantFactors: () => request<{ factors: QuantFactor[] }>('/api/quant/factors'),
+  quantImportStandardExpressionFactors: (root: string, dryRun = true) =>
+    request<StandardExpressionImportResult>('/api/quant/factors/import/standard-expression', {
+      method: 'POST', body: JSON.stringify({ root: root || null, dry_run: dryRun }),
+    }),
+  quantUpdateFactorState: (id: string, payload: { enabled?: boolean; tags?: string[] }) =>
+    request<QuantFactor>(`/api/quant/factors/${encodeURIComponent(id)}/state`, {
+      method: 'PATCH', body: JSON.stringify(payload),
+    }),
   quantMLCapabilities: () => request<MLCapabilities>('/api/quant/ml/capabilities'),
+  quantFactorCache: () => request<FactorCacheStatus>('/api/quant/ml/factor-cache'),
+  quantClearFactorCache: () => request<{
+    cleared: boolean
+    entries_removed: number
+    bytes_removed: number
+  }>('/api/quant/ml/factor-cache', { method: 'DELETE' }),
   quantMLSpecs: () => request<{ specs: MLModelSpec[] }>('/api/quant/ml/specs'),
   quantSaveMLSpec: (spec: MLModelSpec) => request<MLModelSpec>('/api/quant/ml/specs', {
     method: 'POST', body: JSON.stringify(spec),
@@ -1157,6 +1232,18 @@ export const api = {
   quantModelDetail: (version: string) => request<QuantModelDetail>(`/api/quant/ml/models/${encodeURIComponent(version)}`),
   quantPublishModel: (version: string) => request<QuantModel>(`/api/quant/ml/models/${encodeURIComponent(version)}/publish`, { method: 'POST' }),
   quantArchiveModel: (version: string) => request<QuantModel>(`/api/quant/ml/models/${encodeURIComponent(version)}/archive`, { method: 'POST' }),
+  quantModelDeletionImpact: (version: string) => request<ModelDeletionImpact>(`/api/quant/ml/models/${encodeURIComponent(version)}/deletion-impact`),
+  quantDeleteModel: (version: string, confirmVersion: string) => request<{
+    deleted: boolean
+    model_version: string
+    experiments_deleted: number
+    strategies_deleted: number
+    prediction_files_deleted: number
+    bytes_deleted: number
+  }>(`/api/quant/ml/models/${encodeURIComponent(version)}`, {
+    method: 'DELETE',
+    body: JSON.stringify({ confirm_version: confirmVersion, cascade: true }),
+  }),
   quantGeneratePredictions: (version: string) => request<Record<string, any>>(`/api/quant/ml/models/${encodeURIComponent(version)}/predictions`, { method: 'POST' }),
   quantModelBacktest: (version: string, spec: MLBacktestSpec) => request<QuantExperiment>(`/api/quant/ml/models/${encodeURIComponent(version)}/backtests`, {
     method: 'POST', body: JSON.stringify(spec),

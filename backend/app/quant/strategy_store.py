@@ -35,6 +35,10 @@ class QuantStrategyStore:
                 raise ValueError(
                     f"因子 {factor.id} 版本不匹配: 策略={reference.factor_version}, 当前={factor.version}"
                 )
+            if not factor.enabled:
+                raise ValueError(f"因子 {factor.id} 已禁用")
+            if factor.compute_status != "ready":
+                raise ValueError(f"因子 {factor.id} 不可计算: {factor.blocked_reason or factor.compute_status}")
             if spec.asset_type not in factor.asset_types:
                 raise ValueError(f"因子 {factor.id} 不支持资产类型 {spec.asset_type}")
         (self.root / f"{spec.id}.json").write_text(spec.model_dump_json(indent=2), encoding="utf-8")

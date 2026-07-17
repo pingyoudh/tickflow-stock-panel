@@ -20,6 +20,7 @@ from app.quant.experiments import ExperimentManager, ExperimentStore
 from app.quant.factors import FactorRegistry
 from app.quant.ml_backtest import MLBacktestService
 from app.quant.model_center import ModelCenterService
+from app.quant.model_deletion import ModelDeletionConflict, ModelDeletionService
 from app.quant.model_registry import ModelRegistry
 from app.quant.models import (
     FactorDefinition,
@@ -47,6 +48,16 @@ class TrustPayload(BaseModel):
     trusted: bool
 
 
+class FactorImportPayload(BaseModel):
+    root: str | None = None
+    dry_run: bool = True
+
+
+class FactorStatePayload(BaseModel):
+    enabled: bool | None = None
+    tags: list[str] | None = None
+
+
 class TrainPayload(BaseModel):
     spec_id: str | None = None
     spec: ModelSpec | None = None
@@ -67,6 +78,11 @@ class PortfolioPayload(BaseModel):
     benchmark_symbol: str | None = None
 
 
+class ModelDeletePayload(BaseModel):
+    confirm_version: str
+    cascade: bool = False
+
+
 def _services(request: Request) -> dict[str, Any]:
     cached = getattr(request.app.state, "quant_services", None)
     if cached is not None:
@@ -78,6 +94,7 @@ def _services(request: Request) -> dict[str, Any]:
         settings.data_dir,
         factors,
         max_rows=settings.quant_max_panel_rows,
+        factor_cache_max_bytes=settings.quant_factor_cache_max_bytes,
     )
     experiments = ExperimentStore(settings.data_dir)
     searcher = AutoMLSearchEngine(datasets, factors, models, experiments)
@@ -86,6 +103,7 @@ def _services(request: Request) -> dict[str, Any]:
         request.app.state.repo, settings.data_dir, models, experiments
     )
     center = ModelCenterService(models, experiments, backtests, predictions)
+    strategies = QuantStrategyStore(settings.data_dir, factors)
     cached = {
         "factors": factors,
         "models": models,
@@ -104,7 +122,10 @@ def _services(request: Request) -> dict[str, Any]:
         "predictions": predictions,
         "backtests": backtests,
         "center": center,
-        "strategies": QuantStrategyStore(settings.data_dir, factors),
+        "strategies": strategies,
+        "model_deletion": ModelDeletionService(
+            settings.data_dir, models, experiments, strategies
+        ),
     }
     request.app.state.quant_services = cached
     return cached
@@ -151,6 +172,26 @@ def save_code_factor(payload: CodeFactorPayload, request: Request):
         raise _bad_request(exc) from exc
 
 
+@router.post("/factors/import/standard-expression")
+def import_standard_expression_factors(payload: FactorImportPayload, request: Request):
+    try:
+        return _services(request)["factors"].import_standard_expression(
+            payload.root, dry_run=payload.dry_run
+        )
+    except Exception as exc:
+        raise _bad_request(exc) from exc
+
+
+@router.patch("/factors/{factor_id}/state")
+def update_factor_state(factor_id: str, payload: FactorStatePayload, request: Request):
+    try:
+        return _services(request)["factors"].update_state(
+            factor_id, enabled=payload.enabled, tags=payload.tags
+        )
+    except Exception as exc:
+        raise _bad_request(exc) from exc
+
+
 @router.post("/factors/{factor_id}/trust")
 def trust_code_factor(factor_id: str, payload: TrustPayload, request: Request):
     try:
@@ -187,6 +228,19 @@ def delete_quant_strategy(strategy_id: str, request: Request):
 @router.get("/ml/capabilities")
 def capabilities():
     return ml_capabilities()
+
+
+@router.get("/ml/factor-cache")
+def factor_cache_status(request: Request):
+    return _services(request)["datasets"].factor_cache.status()
+
+
+@router.delete("/ml/factor-cache")
+def clear_factor_cache(request: Request):
+    try:
+        return _services(request)["datasets"].factor_cache.clear()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/ml/specs")
@@ -275,6 +329,28 @@ def publish_model(version: str, request: Request):
 def archive_model(version: str, request: Request):
     try:
         return _services(request)["models"].archive(version)
+    except Exception as exc:
+        raise _bad_request(exc) from exc
+
+
+@router.get("/ml/models/{version}/deletion-impact")
+def model_deletion_impact(version: str, request: Request):
+    try:
+        return _services(request)["model_deletion"].impact(version)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.delete("/ml/models/{version}")
+def delete_model(version: str, payload: ModelDeletePayload, request: Request):
+    try:
+        return _services(request)["model_deletion"].delete(
+            version,
+            confirm_version=payload.confirm_version,
+            cascade=payload.cascade,
+        )
+    except ModelDeletionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
         raise _bad_request(exc) from exc
 

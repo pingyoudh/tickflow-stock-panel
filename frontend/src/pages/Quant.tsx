@@ -2,14 +2,15 @@ import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   BarChart3, BrainCircuit, Check, Cpu, FlaskConical, Gauge, Info,
-  History, Layers3, Library, Loader2, Play, RefreshCw, SlidersHorizontal, Sparkles, Trash2,
+  Eye, History, Layers3, Library, Loader2, Play, RefreshCw, Search, SlidersHorizontal, Sparkles, Trash2,
+  Upload, X,
 } from 'lucide-react'
 import { PageHeader } from '@/components/PageHeader'
 import { FactorBacktest } from './backtest/FactorBacktest'
 import { ModelCenter } from './quant/ModelCenter'
 import {
-  api, type MLCapabilities, type MLModelSpec, type MLSearchEstimate, type MLSearchSpec,
-  type QuantExperiment,
+  api, type FactorCacheStatus, type MLCapabilities, type MLModelSpec, type MLSearchEstimate, type MLSearchSpec,
+  type QuantExperiment, type StandardExpressionImportResult,
   type QuantFactor, type QuantModel, type QuantStrategy,
 } from '@/lib/api'
 
@@ -46,6 +47,18 @@ function pct(value: unknown, digits = 2) {
   return Number.isFinite(number) ? `${(number * 100).toFixed(digits)}%` : '--'
 }
 
+function bytes(value: number | undefined) {
+  if (!Number.isFinite(value)) return '--'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let amount = Number(value)
+  let index = 0
+  while (amount >= 1024 && index < units.length - 1) {
+    amount /= 1024
+    index += 1
+  }
+  return `${amount.toFixed(index < 2 ? 0 : 1)} ${units[index]}`
+}
+
 function Status({ value }: { value: string }) {
   const color = value === 'published' || value === 'completed'
     ? 'text-bear border-bear/30 bg-bear/10'
@@ -55,37 +68,250 @@ function Status({ value }: { value: string }) {
   return <span className={`rounded border px-1.5 py-0.5 text-[10px] ${color}`}>{value}</span>
 }
 
+const DEFAULT_STANDARD_EXPRESSION_PATH = String.raw`C:\Users\dzzz\OneDrive\Desktop\AAA`
+
+const factorReady = (item: QuantFactor) => (item.compute_status ?? 'ready') === 'ready'
+const factorEnabled = (item: QuantFactor) => item.enabled !== false
+const factorOrigin = (item: QuantFactor) => item.origin ?? (item.authoring_type === 'builtin' ? 'builtin' : item.authoring_type)
+const factorAdmission = (item: QuantFactor) => item.admission_status ?? (item.authoring_type === 'builtin' ? 'builtin' : 'unscreened')
+
+function cnAdmission(value: string) {
+  return value === 'admitted' ? '入库'
+    : value === 'rejected' ? '不入库'
+      : value === 'builtin' ? '内置'
+        : value === 'published' ? '已发布'
+          : '未筛选'
+}
+
+function cnCompute(value?: string) {
+  return (value ?? 'ready') === 'ready' ? '可计算' : '不可计算'
+}
+
 function FactorLibrary({ factors }: { factors: QuantFactor[] }) {
-  const groups = useMemo(() => ({
-    builtin: factors.filter(item => item.authoring_type === 'builtin'),
-    custom: factors.filter(item => item.authoring_type === 'declarative' || item.authoring_type === 'python'),
-    model: factors.filter(item => item.authoring_type === 'model'),
-  }), [factors])
+  const queryClient = useQueryClient()
+  const [searchText, setSearchText] = useState('')
+  const [family, setFamily] = useState('all')
+  const [origin, setOrigin] = useState('all')
+  const [admission, setAdmission] = useState('all')
+  const [computeStatus, setComputeStatus] = useState('all')
+  const [enabledFilter, setEnabledFilter] = useState('all')
+  const [selected, setSelected] = useState<string[]>([])
+  const [detail, setDetail] = useState<QuantFactor | null>(null)
+  const [importPath, setImportPath] = useState(DEFAULT_STANDARD_EXPRESSION_PATH)
+  const [importResult, setImportResult] = useState<StandardExpressionImportResult | null>(null)
+
+  const invalidateFactors = () => void queryClient.invalidateQueries({ queryKey: ['quant', 'factors'] })
+  const importMutation = useMutation({
+    mutationFn: (dryRun: boolean) => api.quantImportStandardExpressionFactors(importPath, dryRun),
+    onSuccess: result => {
+      setImportResult(result)
+      if (result.imported) invalidateFactors()
+    },
+  })
+  const stateMutation = useMutation({
+    mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) => api.quantUpdateFactorState(id, { enabled }),
+    onSuccess: invalidateFactors,
+  })
+
+  const families = useMemo(() => Array.from(new Set(factors.map(item => item.family || 'other'))).sort(), [factors])
+  const origins = useMemo(() => Array.from(new Set(factors.map(factorOrigin))).sort(), [factors])
+  const filtered = useMemo(() => {
+    const keyword = searchText.trim().toLowerCase()
+    return factors.filter(item => {
+      if (family !== 'all' && item.family !== family) return false
+      if (origin !== 'all' && factorOrigin(item) !== origin) return false
+      if (admission !== 'all' && factorAdmission(item) !== admission) return false
+      if (computeStatus !== 'all' && (item.compute_status ?? 'ready') !== computeStatus) return false
+      if (enabledFilter === 'enabled' && !factorEnabled(item)) return false
+      if (enabledFilter === 'disabled' && factorEnabled(item)) return false
+      if (!keyword) return true
+      const haystack = [
+        item.name, item.id, item.description, item.family, item.source_expression,
+        item.blocked_reason, item.library_name,
+      ].join(' ').toLowerCase()
+      return haystack.includes(keyword)
+    })
+  }, [admission, computeStatus, enabledFilter, factors, family, origin, searchText])
+
+  const readyEnabled = factors.filter(item => factorReady(item) && factorEnabled(item)).length
+  const blocked = factors.filter(item => !factorReady(item)).length
+  const toggleSelect = (id: string) => setSelected(current => current.includes(id) ? current.filter(item => item !== id) : [...current, id])
+  const selectVisible = () => setSelected(filtered.map(item => item.id))
+  const clearSelected = () => setSelected([])
+  const bulkSet = (enabled: boolean) => {
+    for (const id of selected) {
+      const item = factors.find(factor => factor.id === id)
+      if (!item || item.readonly || (enabled && !factorReady(item))) continue
+      stateMutation.mutate({ id, enabled })
+    }
+    setSelected([])
+  }
+
   return (
-    <div className="overflow-hidden border-y border-border bg-surface">
-      <div className="grid grid-cols-[minmax(180px,1.2fr)_100px_110px_minmax(220px,2fr)_120px] border-b border-border bg-elevated/50 px-3 py-2 text-[11px] text-muted">
-        <span>因子</span><span>类型</span><span>资产</span><span>版本 / 描述</span><span>状态</span>
-      </div>
-      {(['builtin', 'custom', 'model'] as const).map(group => groups[group].map(item => (
-        <div key={item.id} className="grid grid-cols-[minmax(180px,1.2fr)_100px_110px_minmax(220px,2fr)_120px] items-center border-b border-border/70 px-3 py-2.5 text-xs last:border-0">
-          <div className="min-w-0"><div className="truncate font-medium">{item.name}</div><div className="truncate font-mono text-[10px] text-muted">{item.id}</div></div>
-          <span className="text-secondary">{item.authoring_type}</span>
-          <span className="text-secondary">{item.asset_types.join(' / ')}</span>
-          <div className="min-w-0"><div className="truncate font-mono text-[10px] text-secondary">{item.version}</div><div className="truncate text-[11px] text-muted">{item.description}</div></div>
-          <span className="text-[11px] text-secondary">{item.authoring_type === 'python' ? (item.trusted ? '已信任' : '未启用') : item.readonly ? '只读' : '可编辑'}</span>
+    <div className="space-y-3">
+      <div className="grid gap-3 border-y border-border bg-surface p-3 xl:grid-cols-[minmax(0,1fr)_360px]">
+        <div className="grid grid-cols-2 gap-px overflow-hidden border border-border bg-border md:grid-cols-4">
+          {[
+            ['全部因子', factors.length],
+            ['启用可计算', readyEnabled],
+            ['不可计算', blocked],
+            ['当前结果', filtered.length],
+          ].map(([label, value]) => (
+            <div key={String(label)} className="bg-base p-2">
+              <div className="text-[10px] text-muted">{label}</div>
+              <div className="mt-1 font-mono text-sm">{Number(value).toLocaleString()}</div>
+            </div>
+          ))}
         </div>
-      )))}
-      {factors.length === 0 && <div className="px-3 py-10 text-center text-xs text-muted">暂无因子</div>}
+        <div className="space-y-2">
+          <div className="flex gap-2">
+            <input className={`${inputClass} font-mono`} value={importPath} onChange={event => setImportPath(event.target.value)} />
+            <button className={quietButton} disabled={importMutation.isPending} onClick={() => importMutation.mutate(true)}>
+              <Search className="h-3 w-3" />预览
+            </button>
+            <button className={actionClass} disabled={importMutation.isPending || !importResult} onClick={() => importMutation.mutate(false)}>
+              {importMutation.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Upload className="h-3.5 w-3.5" />}导入
+            </button>
+          </div>
+          {importResult && (
+            <div className="text-[10px] leading-5 text-muted">
+              {importResult.library_name} · 唯一表达式 {importResult.unique_expressions.toLocaleString()} ·
+              可计算 {importResult.compute_status?.ready ?? 0} · 不可计算 {importResult.blocked}
+              {importResult.imported ? ` · 已导入 ${importResult.imported.toLocaleString()}` : ''}
+            </div>
+          )}
+          {importMutation.error && <div className="text-[11px] text-danger">{importMutation.error.message}</div>}
+        </div>
+      </div>
+
+      <div className="grid gap-2 border-y border-border bg-surface p-3 md:grid-cols-[minmax(220px,1fr)_repeat(5,140px)]">
+        <div className="relative">
+          <Search className="pointer-events-none absolute left-2 top-2 h-3.5 w-3.5 text-muted" />
+          <input className={`${inputClass} pl-7`} value={searchText} onChange={event => setSearchText(event.target.value)} placeholder="搜索中文名 / 表达式 / 原因" />
+        </div>
+        <select className={inputClass} value={family} onChange={event => setFamily(event.target.value)}><option value="all">全部分类</option>{families.map(item => <option key={item} value={item}>{item}</option>)}</select>
+        <select className={inputClass} value={origin} onChange={event => setOrigin(event.target.value)}><option value="all">全部来源</option>{origins.map(item => <option key={item} value={item}>{item}</option>)}</select>
+        <select className={inputClass} value={admission} onChange={event => setAdmission(event.target.value)}><option value="all">全部入库状态</option><option value="admitted">入库</option><option value="rejected">不入库</option><option value="unscreened">未筛选</option><option value="builtin">内置</option></select>
+        <select className={inputClass} value={computeStatus} onChange={event => setComputeStatus(event.target.value)}><option value="all">全部计算状态</option><option value="ready">可计算</option><option value="blocked">不可计算</option></select>
+        <select className={inputClass} value={enabledFilter} onChange={event => setEnabledFilter(event.target.value)}><option value="all">全部启用状态</option><option value="enabled">启用</option><option value="disabled">禁用</option></select>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted">
+        <button className={quietButton} onClick={selectVisible}>选择当前结果</button>
+        <button className={quietButton} onClick={clearSelected}>清空选择</button>
+        <button className={quietButton} disabled={!selected.length || stateMutation.isPending} onClick={() => bulkSet(true)}>批量启用</button>
+        <button className={quietButton} disabled={!selected.length || stateMutation.isPending} onClick={() => bulkSet(false)}>批量禁用</button>
+        <span>已选 {selected.length} 个；不可计算因子会被自动跳过。</span>
+      </div>
+
+      <div className="overflow-x-auto border-y border-border bg-surface">
+        <table className="w-full min-w-[1040px] text-xs">
+          <thead className="bg-elevated/60 text-[11px] text-muted">
+            <tr>
+              <th className="w-9 px-2 py-2"></th>
+              <th className="px-2 py-2 text-left">因子</th>
+              <th className="px-2 py-2 text-left">分类</th>
+              <th className="px-2 py-2 text-left">来源</th>
+              <th className="px-2 py-2 text-left">入库</th>
+              <th className="px-2 py-2 text-left">计算</th>
+              <th className="px-2 py-2 text-left">启用</th>
+              <th className="px-2 py-2 text-left">版本</th>
+              <th className="px-2 py-2 text-right">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map(item => {
+              const ready = factorReady(item)
+              const enabled = factorEnabled(item)
+              return (
+                <tr key={item.id} className="border-t border-border/70">
+                  <td className="px-2 py-2"><input type="checkbox" checked={selected.includes(item.id)} onChange={() => toggleSelect(item.id)} /></td>
+                  <td className="max-w-[260px] px-2 py-2">
+                    <div className="truncate font-medium text-foreground">{item.name}</div>
+                    <div className="truncate font-mono text-[10px] text-muted">{item.id}</div>
+                  </td>
+                  <td className="px-2 py-2 text-secondary">{item.family}</td>
+                  <td className="px-2 py-2 text-secondary">{item.library_name || factorOrigin(item)}</td>
+                  <td className="px-2 py-2"><span className="rounded border border-border px-1.5 py-0.5 text-[10px]">{cnAdmission(factorAdmission(item))}</span></td>
+                  <td className={`px-2 py-2 ${ready ? 'text-bear' : 'text-danger'}`}>{cnCompute(item.compute_status)}</td>
+                  <td className="px-2 py-2">{enabled ? <span className="text-bear">启用</span> : <span className="text-muted">禁用</span>}</td>
+                  <td className="px-2 py-2 font-mono text-[10px] text-muted">{item.version}</td>
+                  <td className="px-2 py-2">
+                    <div className="flex justify-end gap-1">
+                      <button className={quietButton} onClick={() => setDetail(item)} title="详情"><Eye className="h-3 w-3" /></button>
+                      {!item.readonly && (
+                        <button className={quietButton} disabled={stateMutation.isPending || (!enabled && !ready)} onClick={() => stateMutation.mutate({ id: item.id, enabled: !enabled })}>
+                          {enabled ? '禁用' : '启用'}
+                        </button>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+        {filtered.length === 0 && <div className="px-3 py-10 text-center text-xs text-muted">暂无匹配因子</div>}
+      </div>
+
+      {detail && (
+        <div className="fixed inset-y-0 right-0 z-30 w-full max-w-xl border-l border-border bg-surface shadow-xl">
+          <div className="flex h-12 items-center justify-between border-b border-border px-4">
+            <div className="min-w-0"><div className="truncate text-sm font-semibold">{detail.name}</div><div className="truncate font-mono text-[10px] text-muted">{detail.id}</div></div>
+            <button className={quietButton} onClick={() => setDetail(null)}><X className="h-3 w-3" /></button>
+          </div>
+          <div className="h-[calc(100%-3rem)] overflow-y-auto p-4 text-xs">
+            <div className="grid grid-cols-2 gap-2">
+              <InfoCell label="分类" value={detail.family} />
+              <InfoCell label="来源" value={detail.library_name || factorOrigin(detail)} />
+              <InfoCell label="入库状态" value={cnAdmission(factorAdmission(detail))} />
+              <InfoCell label="计算状态" value={cnCompute(detail.compute_status)} />
+              <InfoCell label="启用状态" value={factorEnabled(detail) ? '启用' : '禁用'} />
+              <InfoCell label="来源行" value={detail.source_row || '--'} />
+            </div>
+            <DetailBlock title="说明" value={detail.description || '--'} />
+            <DetailBlock title="标准表达式" value={detail.source_expression || '--'} mono />
+            <DetailBlock title="阻塞原因" value={detail.blocked_reason || '无'} />
+            <DetailBlock title="字段依赖" value={(detail.raw_fields ?? []).join(', ') || '--'} mono />
+            <DetailBlock title="算子依赖" value={(detail.operators ?? []).join(', ') || '--'} mono />
+            <DetailBlock title="来源文件" value={detail.source_file || '--'} mono />
+          </div>
+        </div>
+      )}
     </div>
   )
 }
 
-function CapabilityBar({ data }: { data?: MLCapabilities }) {
+function InfoCell({ label, value }: { label: string; value: string }) {
+  return <div className="border border-border bg-base p-2"><div className="text-[10px] text-muted">{label}</div><div className="mt-1 break-all">{value}</div></div>
+}
+
+function DetailBlock({ title, value, mono = false }: { title: string; value: string; mono?: boolean }) {
+  return <div className="mt-4"><div className="mb-1 text-[11px] font-medium text-secondary">{title}</div><div className={`whitespace-pre-wrap break-all rounded-btn border border-border bg-base p-2 leading-5 ${mono ? 'font-mono text-[11px]' : 'text-xs'}`}>{value}</div></div>
+}
+
+function AssetTypeSwitch({ value, onChange }: {
+  value: 'stock' | 'etf'
+  onChange: (value: 'stock' | 'etf') => void
+}) {
+  return <div className="col-span-2 flex h-8 rounded-btn border border-border bg-base p-0.5">
+    {(['stock', 'etf'] as const).map(item => <button key={item} type="button" onClick={() => onChange(item)} className={`flex-1 rounded-[5px] text-[11px] ${value === item ? 'bg-accent text-white' : 'text-muted hover:bg-elevated'}`}>{item === 'stock' ? 'A股' : 'ETF'}</button>)}
+  </div>
+}
+
+function CapabilityBar({ data, cache, clearing, onClearCache }: {
+  data?: MLCapabilities
+  cache?: FactorCacheStatus
+  clearing: boolean
+  onClearCache: () => void
+}) {
   const gpu = data?.gpu
   return (
     <div className="flex flex-wrap items-center gap-x-5 gap-y-2 border-y border-border bg-surface px-3 py-2 text-xs">
       <span className="inline-flex items-center gap-1.5"><Gauge className="h-3.5 w-3.5 text-accent" />{gpu?.available ? `${gpu.name} · ${gpu.memory_mb} MB` : 'GPU 未探测到'}</span>
       <span className="inline-flex items-center gap-1.5"><Cpu className="h-3.5 w-3.5 text-secondary" />CPU 线程 {data?.cpu_threads ?? '--'}</span>
+      <span className="inline-flex items-center gap-1.5"><Layers3 className="h-3.5 w-3.5 text-secondary" />因子缓存 {bytes(cache?.used_bytes)} / {bytes(cache?.max_bytes)} · {cache?.entries ?? 0} 项</span>
+      <button className={quietButton} disabled={clearing || !cache?.entries || Boolean(cache?.active_entries)} title={cache?.active_entries ? '训练使用中的缓存不能清理' : '清理可重新生成的因子原值缓存'} onClick={onClearCache}>{clearing ? <Loader2 className="h-3 w-3 animate-spin" /> : <Trash2 className="h-3 w-3" />}清理缓存</button>
       {Object.entries(data?.algorithms ?? {}).map(([name, item]) => (
         <span key={name} className={item.installed ? 'text-bear' : 'text-warning'}>{name} {item.installed ? item.version : '未安装'}</span>
       ))}
@@ -99,7 +325,8 @@ function SmartTrainingPanel({ factors, busy, onEstimate, onSearch }: {
   onEstimate: (spec: MLSearchSpec) => Promise<MLSearchEstimate>
   onSearch: (spec: MLSearchSpec) => void
 }) {
-  const candidates = factors.filter(item => item.authoring_type !== 'model' && item.asset_types.includes('stock'))
+  const [assetType, setAssetType] = useState<'stock' | 'etf'>('stock')
+  const candidates = factors.filter(item => item.authoring_type !== 'model' && item.asset_types.includes(assetType) && factorEnabled(item) && factorReady(item))
   const [roles, setRoles] = useState<Record<string, 'auto' | 'required' | 'excluded'>>({})
   const [name, setName] = useState('A股多因子智能模型')
   const [symbols, setSymbols] = useState('')
@@ -107,6 +334,7 @@ function SmartTrainingPanel({ factors, busy, onEstimate, onSearch }: {
   const [end, setEnd] = useState(isoDate())
   const [horizon, setHorizon] = useState<1 | 5 | 10 | 20>(5)
   const [benchmark, setBenchmark] = useState('000300.SH')
+  const [benchmarkMode, setBenchmarkMode] = useState<'index' | 'cross_section_mean'>('index')
   const [budget, setBudget] = useState<'quick' | 'standard' | 'overnight'>('standard')
   const [device, setDevice] = useState<'auto' | 'cpu' | 'gpu'>('auto')
   const [estimate, setEstimate] = useState<MLSearchEstimate | null>(null)
@@ -118,17 +346,31 @@ function SmartTrainingPanel({ factors, busy, onEstimate, onSearch }: {
   const minFeatures = Math.min(8, Math.max(1, availableCount))
   const maxFeatures = Math.min(30, Math.max(minFeatures, availableCount))
   const buildSpec = (): MLSearchSpec => ({
-    id: `automl_${Date.now()}`, name, asset_type: 'stock',
+    id: `automl_${Date.now()}`, name, asset_type: assetType,
     symbols: symbols.trim() ? symbols.split(/[,，\s]+/).filter(Boolean) : null,
-    start, end, target: { horizon, benchmark_mode: 'index', benchmark_symbol: benchmark },
+    start, end, target: {
+      horizon,
+      benchmark_mode: assetType === 'etf' ? benchmarkMode : 'index',
+      benchmark_symbol: assetType === 'etf' && benchmarkMode === 'cross_section_mean' ? null : benchmark,
+    },
     factor_pool: references, required_factors: required, excluded_factors: excluded,
-    algorithms: ['elastic_net', 'lightgbm', 'xgboost'], budget,
+    algorithms: ['elastic_net', 'lightgbm', 'xgboost'], budget, search_strategy: 'adaptive',
     min_features: minFeatures, max_features: maxFeatures, shortlist_limit: 80,
     inner_folds: 3, inner_validation_days: 63,
     walk_forward: { train_days: 756, validation_days: 126, test_days: 126, step_days: 126 },
     costs: { top_n: 10, commission_pct: 0.0002, stamp_tax_pct: 0.0005, slippage_bps: 5 },
-    device, seed: 42, universe_filters: {},
+    device, seed: 42, universe_filters: assetType === 'etf' && !symbols.trim()
+      ? { min_history_days: 120, min_median_amount_20d: 10_000_000 }
+      : {},
   })
+  const changeAssetType = (value: 'stock' | 'etf') => {
+    setAssetType(value)
+    setRoles({})
+    setEstimate(null)
+    setEstimateError('')
+    setName(value === 'etf' ? 'ETF多因子智能模型' : 'A股多因子智能模型')
+    setBenchmarkMode(value === 'etf' ? 'cross_section_mean' : 'index')
+  }
   const cycleRole = (id: string) => setRoles(current => ({
     ...current,
     [id]: current[id] === 'required' ? 'excluded' : current[id] === 'excluded' ? 'auto' : 'required',
@@ -139,16 +381,18 @@ function SmartTrainingPanel({ factors, busy, onEstimate, onSearch }: {
   }
   return <div className="grid gap-4 border-y border-border bg-surface p-3 xl:grid-cols-[380px_1fr]">
     <div className="grid grid-cols-2 gap-3 content-start">
+      <AssetTypeSwitch value={assetType} onChange={changeAssetType} />
       <label className="col-span-2 text-[11px] text-muted">模型名称<input className={`${inputClass} mt-1`} value={name} onChange={event => setName(event.target.value)} /></label>
       <label className="text-[11px] text-muted">开始日期<input type="date" className={`${inputClass} mt-1`} value={start} onChange={event => setStart(event.target.value)} /></label>
       <label className="text-[11px] text-muted">结束日期<input type="date" className={`${inputClass} mt-1`} value={end} onChange={event => setEnd(event.target.value)} /></label>
       <label className="text-[11px] text-muted">预测周期<select className={`${inputClass} mt-1`} value={horizon} onChange={event => setHorizon(Number(event.target.value) as typeof horizon)}>{[1, 5, 10, 20].map(value => <option key={value} value={value}>{value} 个交易日</option>)}</select></label>
       <label className="text-[11px] text-muted">计算预算<select className={`${inputClass} mt-1`} value={budget} onChange={event => setBudget(event.target.value as typeof budget)}><option value="quick">快速 · 8 试验</option><option value="standard">标准 · 72 试验</option><option value="overnight">隔夜 · 180 试验</option></select></label>
-      <label className="text-[11px] text-muted">基准<input className={`${inputClass} mt-1 font-mono`} value={benchmark} onChange={event => setBenchmark(event.target.value)} /></label>
+      {assetType === 'etf' ? <label className="text-[11px] text-muted">标签基准<select className={`${inputClass} mt-1`} value={benchmarkMode} onChange={event => setBenchmarkMode(event.target.value as typeof benchmarkMode)}><option value="cross_section_mean">ETF池截面平均</option><option value="index">指定指数</option></select></label> : <label className="text-[11px] text-muted">基准<input className={`${inputClass} mt-1 font-mono`} value={benchmark} onChange={event => setBenchmark(event.target.value)} /></label>}
       <label className="text-[11px] text-muted">设备<select className={`${inputClass} mt-1`} value={device} onChange={event => setDevice(event.target.value as typeof device)}><option value="auto">自动回退</option><option value="gpu">GPU 优先</option><option value="cpu">CPU</option></select></label>
-      <label className="col-span-2 text-[11px] text-muted">股票池（留空为全市场）<input className={`${inputClass} mt-1 font-mono`} value={symbols} onChange={event => setSymbols(event.target.value)} placeholder="600000.SH, 000001.SZ" /></label>
+      {assetType === 'etf' && benchmarkMode === 'index' && <label className="col-span-2 text-[11px] text-muted">指数基准<input className={`${inputClass} mt-1 font-mono`} value={benchmark} onChange={event => setBenchmark(event.target.value)} placeholder="000300.SH" /></label>}
+      <label className="col-span-2 text-[11px] text-muted">{assetType === 'etf' ? 'ETF池' : '股票池'}（留空为全市场）<input className={`${inputClass} mt-1 font-mono`} value={symbols} onChange={event => setSymbols(event.target.value)} placeholder={assetType === 'etf' ? '510300.SH, 159915.SZ' : '600000.SH, 000001.SZ'} /></label>
       <div className="col-span-2 grid grid-cols-2 gap-2"><button className={quietButton} disabled={busy || references.length === 0} onClick={() => void estimateResources()}><Info className="h-3 w-3" />估算资源</button><button className={actionClass} disabled={busy || availableCount < minFeatures || !name.trim()} onClick={() => onSearch(buildSpec())}>{busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}开始智能训练</button></div>
-      {estimate && <div className="col-span-2 grid grid-cols-2 gap-px border border-border bg-border text-[10px]"><div className="bg-base p-2"><span className="text-muted">预计面板</span><div className="mt-1 font-mono">{estimate.estimated_rows.toLocaleString()} 行</div></div><div className="bg-base p-2"><span className="text-muted">锁定因子</span><div className="mt-1 font-mono">{estimate.factor_count} 个</div></div><div className="bg-base p-2"><span className="text-muted">每窗口候选</span><div className="mt-1 font-mono">{estimate.search_trials_per_window} 次</div></div><div className="bg-base p-2"><span className="text-muted">模型拟合</span><div className="mt-1 font-mono">{estimate.estimated_model_fits} 次</div></div><div className="bg-base p-2"><span className="text-muted">外层测试折</span><div className="mt-1 font-mono">{estimate.outer_folds}</div></div><div className="bg-base p-2"><span className="text-muted">预计耗时</span><div className="mt-1 font-mono">约 {estimate.estimated_hours} 小时</div></div></div>}
+      {estimate && <div className="col-span-2 grid grid-cols-2 gap-px border border-border bg-border text-[10px]"><div className="bg-base p-2"><span className="text-muted">预计面板</span><div className="mt-1 font-mono">{estimate.estimated_rows.toLocaleString()} 行</div></div><div className="bg-base p-2"><span className="text-muted">锁定因子</span><div className="mt-1 font-mono">{estimate.factor_count} 个</div></div><div className="bg-base p-2"><span className="text-muted">分阶段候选</span><div className="mt-1 font-mono">{estimate.search_stages?.join(' → ') ?? estimate.search_trials_per_window}</div></div><div className="bg-base p-2"><span className="text-muted">模型拟合</span><div className="mt-1 font-mono">{estimate.estimated_model_fits} 次</div></div><div className="bg-base p-2"><span className="text-muted">缓存命中</span><div className="mt-1 font-mono">{pct(estimate.factor_cache?.hit_ratio, 0)}</div></div><div className="bg-base p-2"><span className="text-muted">预计耗时</span><div className="mt-1 font-mono">约 {estimate.estimated_hours} 小时</div></div></div>}
       {estimateError && <div className="col-span-2 text-[11px] text-danger">{estimateError}</div>}
       {estimate?.warnings.map(item => <div key={item} className="col-span-2 text-[10px] text-warning">{item}</div>)}
     </div>
@@ -166,7 +410,8 @@ function ManualTrainingPanel({ factors, busy, onTrain }: {
   busy: boolean
   onTrain: (spec: MLModelSpec) => void
 }) {
-  const candidates = factors.filter(item => item.authoring_type !== 'model' && item.asset_types.includes('stock'))
+  const [assetType, setAssetType] = useState<'stock' | 'etf'>('stock')
+  const candidates = factors.filter(item => item.authoring_type !== 'model' && item.asset_types.includes(assetType) && factorEnabled(item) && factorReady(item))
   const [algorithm, setAlgorithm] = useState<'lightgbm' | 'xgboost'>('xgboost')
   const [device, setDevice] = useState<'auto' | 'cpu' | 'gpu'>('auto')
   const [features, setFeatures] = useState<string[]>(['momentum_20d', 'annual_vol_20d', 'rsi_14', 'turnover_rate'])
@@ -176,30 +421,52 @@ function ManualTrainingPanel({ factors, busy, onTrain }: {
   const [end, setEnd] = useState(isoDate())
   const [horizon, setHorizon] = useState<1 | 5 | 10 | 20>(5)
   const [benchmark, setBenchmark] = useState('000300.SH')
+  const [benchmarkMode, setBenchmarkMode] = useState<'index' | 'cross_section_mean'>('index')
   const [tuning, setTuning] = useState(false)
 
   const submit = () => onTrain({
     id: `model_${Date.now()}`,
-    name, algorithm, asset_type: 'stock',
+    name, algorithm, asset_type: assetType,
     symbols: symbols.trim() ? symbols.split(/[,，\s]+/).filter(Boolean) : null,
     features, start, end,
-    target: { horizon, benchmark_mode: 'index', benchmark_symbol: benchmark },
+    target: {
+      horizon,
+      benchmark_mode: assetType === 'etf' ? benchmarkMode : 'index',
+      benchmark_symbol: assetType === 'etf' && benchmarkMode === 'cross_section_mean' ? null : benchmark,
+    },
     walk_forward: { train_days: 756, validation_days: 126, test_days: 126, step_days: 126 },
     tuning: { enabled: tuning, max_trials: 20 },
-    device, params: {}, seed: 42, universe_filters: {},
+    device, params: {}, seed: 42,
+    universe_filters: assetType === 'etf' && !symbols.trim()
+      ? { min_history_days: 120, min_median_amount_20d: 10_000_000 }
+      : {},
   })
+  const changeAssetType = (value: 'stock' | 'etf') => {
+    setAssetType(value)
+    setName(value === 'etf' ? 'ETF多因子收益模型' : 'A股多因子收益模型')
+    setBenchmarkMode(value === 'etf' ? 'cross_section_mean' : 'index')
+    const defaults = value === 'etf'
+      ? ['momentum_20d', 'annual_vol_20d', 'rsi_14']
+      : ['momentum_20d', 'annual_vol_20d', 'rsi_14', 'turnover_rate']
+    const available = new Set(
+      factors.filter(item => item.asset_types.includes(value) && factorEnabled(item) && factorReady(item)).map(item => item.id),
+    )
+    setFeatures(defaults.filter(id => available.has(id)))
+  }
 
   return (
     <div className="grid gap-4 border-y border-border bg-surface p-3 xl:grid-cols-[360px_1fr]">
         <div className="grid grid-cols-2 gap-3 content-start">
+          <AssetTypeSwitch value={assetType} onChange={changeAssetType} />
           <label className="col-span-2 text-[11px] text-muted">模型名称<input className={`${inputClass} mt-1`} value={name} onChange={e => setName(e.target.value)} /></label>
           <label className="text-[11px] text-muted">算法<select className={`${inputClass} mt-1`} value={algorithm} onChange={e => setAlgorithm(e.target.value as typeof algorithm)}><option value="lightgbm">LightGBM</option><option value="xgboost">XGBoost</option></select></label>
           <label className="text-[11px] text-muted">设备<select className={`${inputClass} mt-1`} value={device} onChange={e => setDevice(e.target.value as typeof device)}><option value="auto">自动回退</option><option value="gpu">GPU 优先</option><option value="cpu">CPU</option></select></label>
           <label className="text-[11px] text-muted">开始日期<input type="date" className={`${inputClass} mt-1`} value={start} onChange={e => setStart(e.target.value)} /></label>
           <label className="text-[11px] text-muted">结束日期<input type="date" className={`${inputClass} mt-1`} value={end} onChange={e => setEnd(e.target.value)} /></label>
           <label className="text-[11px] text-muted">预测周期<select className={`${inputClass} mt-1`} value={horizon} onChange={e => setHorizon(Number(e.target.value) as typeof horizon)}>{[1, 5, 10, 20].map(value => <option key={value} value={value}>{value} 个交易日</option>)}</select></label>
-          <label className="text-[11px] text-muted">基准<input className={`${inputClass} mt-1 font-mono`} value={benchmark} onChange={e => setBenchmark(e.target.value)} /></label>
-          <label className="col-span-2 text-[11px] text-muted">股票池（留空为全市场）<input className={`${inputClass} mt-1 font-mono`} value={symbols} onChange={e => setSymbols(e.target.value)} placeholder="600000.SH, 000001.SZ" /></label>
+          {assetType === 'etf' ? <label className="text-[11px] text-muted">标签基准<select className={`${inputClass} mt-1`} value={benchmarkMode} onChange={event => setBenchmarkMode(event.target.value as typeof benchmarkMode)}><option value="cross_section_mean">ETF池截面平均</option><option value="index">指定指数</option></select></label> : <label className="text-[11px] text-muted">基准<input className={`${inputClass} mt-1 font-mono`} value={benchmark} onChange={e => setBenchmark(e.target.value)} /></label>}
+          {assetType === 'etf' && benchmarkMode === 'index' && <label className="col-span-2 text-[11px] text-muted">指数基准<input className={`${inputClass} mt-1 font-mono`} value={benchmark} onChange={e => setBenchmark(e.target.value)} placeholder="000300.SH" /></label>}
+          <label className="col-span-2 text-[11px] text-muted">{assetType === 'etf' ? 'ETF池' : '股票池'}（留空为全市场）<input className={`${inputClass} mt-1 font-mono`} value={symbols} onChange={e => setSymbols(e.target.value)} placeholder={assetType === 'etf' ? '510300.SH, 159915.SZ' : '600000.SH, 000001.SZ'} /></label>
           <label className="col-span-2 flex items-center gap-2 text-xs text-secondary"><input type="checkbox" checked={tuning} onChange={e => setTuning(e.target.checked)} />Optuna · 每折最多 20 次</label>
           <button className={`${actionClass} col-span-2`} disabled={busy || features.length === 0 || !name.trim()} onClick={submit}>{busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}开始 Walk-forward 训练</button>
         </div>
@@ -216,17 +483,20 @@ function ManualTrainingPanel({ factors, busy, onTrain }: {
   )
 }
 
-function TrainingWorkspace({ factors, capabilities, trainBusy, searchBusy, onTrain, onEstimate, onSearch }: {
+function TrainingWorkspace({ factors, capabilities, factorCache, cacheBusy, trainBusy, searchBusy, onClearCache, onTrain, onEstimate, onSearch }: {
   factors: QuantFactor[]
   capabilities?: MLCapabilities
+  factorCache?: FactorCacheStatus
+  cacheBusy: boolean
   trainBusy: boolean
   searchBusy: boolean
+  onClearCache: () => void
   onTrain: (spec: MLModelSpec) => void
   onEstimate: (spec: MLSearchSpec) => Promise<MLSearchEstimate>
   onSearch: (spec: MLSearchSpec) => void
 }) {
   const [mode, setMode] = useState<'smart' | 'manual'>('smart')
-  return <div className="space-y-3"><CapabilityBar data={capabilities} /><div className="flex border-b border-border"><button className={`inline-flex h-8 items-center gap-1.5 border-b-2 px-3 text-[11px] ${mode === 'smart' ? 'border-accent text-foreground' : 'border-transparent text-muted'}`} onClick={() => setMode('smart')}><Sparkles className="h-3.5 w-3.5" />智能训练</button><button className={`inline-flex h-8 items-center gap-1.5 border-b-2 px-3 text-[11px] ${mode === 'manual' ? 'border-accent text-foreground' : 'border-transparent text-muted'}`} onClick={() => setMode('manual')}><SlidersHorizontal className="h-3.5 w-3.5" />手工训练</button></div>{mode === 'smart' ? <SmartTrainingPanel factors={factors} busy={searchBusy} onEstimate={onEstimate} onSearch={onSearch} /> : <ManualTrainingPanel factors={factors} busy={trainBusy} onTrain={onTrain} />}</div>
+  return <div className="space-y-3"><CapabilityBar data={capabilities} cache={factorCache} clearing={cacheBusy} onClearCache={onClearCache} /><div className="flex border-b border-border"><button className={`inline-flex h-8 items-center gap-1.5 border-b-2 px-3 text-[11px] ${mode === 'smart' ? 'border-accent text-foreground' : 'border-transparent text-muted'}`} onClick={() => setMode('smart')}><Sparkles className="h-3.5 w-3.5" />智能训练</button><button className={`inline-flex h-8 items-center gap-1.5 border-b-2 px-3 text-[11px] ${mode === 'manual' ? 'border-accent text-foreground' : 'border-transparent text-muted'}`} onClick={() => setMode('manual')}><SlidersHorizontal className="h-3.5 w-3.5" />手工训练</button></div>{mode === 'smart' ? <SmartTrainingPanel factors={factors} busy={searchBusy} onEstimate={onEstimate} onSearch={onSearch} /> : <ManualTrainingPanel factors={factors} busy={trainBusy} onTrain={onTrain} />}</div>
 }
 
 function StrategyPanel({ factors, strategies, busy, onSave, onDelete }: {
@@ -236,7 +506,7 @@ function StrategyPanel({ factors, strategies, busy, onSave, onDelete }: {
   onSave: (spec: QuantStrategy) => void
   onDelete: (id: string) => void
 }) {
-  const available = factors.filter(item => item.asset_types.includes('stock'))
+  const available = factors.filter(item => item.asset_types.includes('stock') && factorEnabled(item) && factorReady(item))
   const [name, setName] = useState('多因子选股策略')
   const [selected, setSelected] = useState<string[]>([])
   const [topN, setTopN] = useState(10)
@@ -306,16 +576,21 @@ export function Quant() {
   const queryClient = useQueryClient()
   const factors = useQuery({ queryKey: ['quant', 'factors'], queryFn: api.quantFactors })
   const capabilities = useQuery({ queryKey: ['quant', 'capabilities'], queryFn: api.quantMLCapabilities })
+  const factorCache = useQuery({ queryKey: ['quant', 'factor-cache'], queryFn: api.quantFactorCache })
   const models = useQuery({ queryKey: ['quant', 'models'], queryFn: api.quantModels })
   const strategies = useQuery({ queryKey: ['quant', 'strategies'], queryFn: api.quantStrategies })
   const experiments = useQuery({ queryKey: ['quant', 'experiments'], queryFn: api.quantExperiments, refetchInterval: query => query.state.data?.experiments.some(item => ['queued', 'running', 'cancelling'].includes(item.status)) ? 1500 : false })
   const train = useMutation({ mutationFn: api.quantTrain, onSuccess: () => { void queryClient.invalidateQueries({ queryKey: ['quant', 'experiments'] }); setTab('experiments') } })
   const search = useMutation({ mutationFn: api.quantSearch, onSuccess: () => { void queryClient.invalidateQueries({ queryKey: ['quant', 'experiments'] }); setTab('experiments') } })
+  const clearFactorCache = useMutation({
+    mutationFn: api.quantClearFactorCache,
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['quant', 'factor-cache'] }),
+  })
   const experimentAction = useMutation<unknown, Error, { action: 'cancel' | 'rerun' | 'delete'; id: string }>({ mutationFn: ({ action, id }) => action === 'cancel' ? api.quantCancelExperiment(id) : action === 'rerun' ? api.quantRerunExperiment(id) : api.quantDeleteExperiment(id), onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['quant', 'experiments'] }) })
   const strategyAction = useMutation<unknown, Error, { action: 'save' | 'delete'; spec?: QuantStrategy; id?: string }>({ mutationFn: ({ action, spec, id }) => action === 'save' ? api.quantSaveStrategy(spec!) : api.quantDeleteStrategy(id!), onSuccess: () => void queryClient.invalidateQueries({ queryKey: ['quant', 'strategies'] }) })
   const tabSwitch = <div className="flex max-w-full overflow-x-auto rounded-btn border border-border bg-surface p-0.5">{TABS.map(item => { const Icon = item.icon; return <button key={item.id} onClick={() => setTab(item.id)} className={`inline-flex h-7 shrink-0 items-center gap-1.5 rounded-[5px] px-2.5 text-[11px] ${tab === item.id ? 'bg-accent text-white' : 'text-secondary hover:bg-elevated'}`}><Icon className="h-3.5 w-3.5" />{item.label}</button> })}</div>
   const factorRows = factors.data?.factors ?? []
   const modelRows = models.data?.models ?? []
   const openPortfolio = (version: string) => { setPortfolioVersion(version); setTab('portfolio') }
-  return <div className="min-h-full bg-base"><PageHeader title="量化研究" subtitle="因子 · 机器学习 · 组合" right={tabSwitch} /><main className="p-3 lg:p-4">{tab === 'factors' && <FactorLibrary factors={factorRows} />}{tab === 'research' && <FactorBacktest />}{tab === 'training' && <TrainingWorkspace factors={factorRows} capabilities={capabilities.data} trainBusy={train.isPending} searchBusy={search.isPending} onTrain={spec => train.mutate(spec)} onEstimate={api.quantSearchEstimate} onSearch={spec => search.mutate(spec)} />}{tab === 'models' && <ModelCenter models={modelRows} onPortfolio={openPortfolio} />}{tab === 'strategy' && <StrategyPanel factors={factorRows} strategies={strategies.data?.strategies ?? []} busy={strategyAction.isPending} onSave={spec => strategyAction.mutate({ action: 'save', spec })} onDelete={id => strategyAction.mutate({ action: 'delete', id })} />}{tab === 'portfolio' && <PortfolioPanel key={portfolioVersion} models={modelRows} initialVersion={portfolioVersion} />}{tab === 'experiments' && <ExperimentsPanel experiments={experiments.data?.experiments ?? []} busy={experimentAction.isPending} onAction={(action, id) => experimentAction.mutate({ action, id })} />}</main></div>
+  return <div className="min-h-full bg-base"><PageHeader title="量化研究" subtitle="因子 · 机器学习 · 组合" right={tabSwitch} /><main className="p-3 lg:p-4">{tab === 'factors' && <FactorLibrary factors={factorRows} />}{tab === 'research' && <FactorBacktest />}{tab === 'training' && <TrainingWorkspace factors={factorRows} capabilities={capabilities.data} factorCache={factorCache.data} cacheBusy={clearFactorCache.isPending} trainBusy={train.isPending} searchBusy={search.isPending} onClearCache={() => clearFactorCache.mutate()} onTrain={spec => train.mutate(spec)} onEstimate={api.quantSearchEstimate} onSearch={spec => search.mutate(spec)} />}{tab === 'models' && <ModelCenter models={modelRows} factors={factorRows} onPortfolio={openPortfolio} />}{tab === 'strategy' && <StrategyPanel factors={factorRows} strategies={strategies.data?.strategies ?? []} busy={strategyAction.isPending} onSave={spec => strategyAction.mutate({ action: 'save', spec })} onDelete={id => strategyAction.mutate({ action: 'delete', id })} />}{tab === 'portfolio' && <PortfolioPanel key={portfolioVersion} models={modelRows} initialVersion={portfolioVersion} />}{tab === 'experiments' && <ExperimentsPanel experiments={experiments.data?.experiments ?? []} busy={experimentAction.isPending} onAction={(action, id) => experimentAction.mutate({ action, id })} />}</main></div>
 }
