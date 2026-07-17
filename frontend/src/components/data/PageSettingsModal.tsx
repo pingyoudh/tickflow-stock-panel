@@ -40,14 +40,15 @@ export const DATA_CARD_DEFS: CardDef[] = [
   { key: 'adj_factor',  label: '除权因子', desc: '复权计算因子',           defaultHiddenIfNoCap: true },
   { key: 'enriched',    label: 'Enriched', desc: '技术指标计算结果',       defaultHiddenIfNoCap: false },
   { key: 'index',       label: '指数',     desc: '主要市场指数日K',        defaultHiddenIfNoCap: false },
-  { key: 'etf',         label: 'ETF',      desc: '场内交易基金日K',         defaultHiddenIfNoCap: false, defaultHidden: true },
+  { key: 'etf',         label: 'ETF',      desc: '场内交易基金日K与指标',   defaultHiddenIfNoCap: false },
   { key: 'minute',      label: '分钟 K',   desc: '分钟级K线(需 Pro+)',     defaultHiddenIfNoCap: true },
   { key: 'financials',  label: '财务数据', desc: '财报数据(需 Expert)',    defaultHiddenIfNoCap: true },
 ]
 
 const DEFAULT_ORDER = DATA_CARD_DEFS.map(d => d.key)
 /** 恢复默认时显示的卡片数量(按默认顺序取前 N 张) */
-const DEFAULT_VISIBLE_COUNT = 5
+const DEFAULT_VISIBLE_COUNT = 6
+const VISIBILITY_VERSION = 2
 
 const CAP_KEY_MAP: Partial<Record<CardKey, string>> = {
   adj_factor: 'adj_factor',
@@ -66,7 +67,15 @@ export function getCardVisibility(
   caps: Record<string, unknown> | undefined,
 ): Record<string, boolean> {
   const has = (capKey: string) => !capKey || !!caps?.[capKey]
-  const override = storage.dataCardVisible.get({})
+  let override = storage.dataCardVisible.get({})
+  if (storage.dataCardVisibilityVersion.get(0) < VISIBILITY_VERSION) {
+    // ETF 曾由“恢复默认”写成 false。迁移时仅清除此旧默认，之后仍尊重用户操作。
+    const migrated = { ...override }
+    delete migrated.etf
+    override = migrated
+    storage.dataCardVisible.set(migrated)
+    storage.dataCardVisibilityVersion.set(VISIBILITY_VERSION)
+  }
   const result: Record<string, boolean> = {}
   for (const def of DATA_CARD_DEFS) {
     if (def.key in override) {
@@ -119,11 +128,12 @@ export function PageSettingsModal({
   const toggle = (key: CardKey) => persistVisible({ ...visible, [key]: !(visible[key] ?? true) })
 
   const reset = () => {
-    // 恢复默认: 默认顺序 + 仅勾选前 5 张卡片, 其余隐藏
+    // 恢复默认: 默认顺序 + 显示 A 股、指数和 ETF 主卡片，其余隐藏。
     const defaultOrder = [...DEFAULT_ORDER]
     const defaultVisible: Record<string, boolean> = {}
     defaultOrder.forEach((k, i) => { defaultVisible[k] = i < DEFAULT_VISIBLE_COUNT })
     storage.dataCardVisible.set(defaultVisible)
+    storage.dataCardVisibilityVersion.set(VISIBILITY_VERSION)
     storage.dataCardOrder.set(defaultOrder)
     setVisible(defaultVisible)
     setOrder(defaultOrder)

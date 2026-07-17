@@ -15,6 +15,7 @@ import numpy as np
 import polars as pl
 
 from app.backtest.engine import BacktestEngine
+from app.quant.factors import builtin_factor_columns
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,8 @@ FACTOR_COLUMNS: list[dict] = [
     {"id": "change_pct",   "label": "日涨跌幅",    "group": "基础",     "desc": "当日涨跌幅"},
     {"id": "amplitude",    "label": "日振幅",      "group": "基础",     "desc": "当日振幅 (最高-最低)/昨收"},
 ]
+# 新量化注册中心是内置因子定义的唯一运行时来源；返回结构保持旧 API 兼容。
+FACTOR_COLUMNS = builtin_factor_columns()
 
 FACTOR_WARMUP_DAYS = 120
 

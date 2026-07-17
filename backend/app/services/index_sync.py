@@ -6,14 +6,14 @@ quotes.get_by_universes 作为补充来源。日K统一走 klines.batch。
 """
 from __future__ import annotations
 
-import logging
 import gc
+import logging
 from collections.abc import Callable
 from datetime import datetime, timedelta
 
 import polars as pl
 
-from app.indicators.pipeline import compute_enriched
+from app.indicators.pipeline import ENRICHED_STORAGE_COLS, compute_enriched
 from app.services import kline_sync, preferences
 from app.tickflow.capabilities import Cap, CapabilitySet
 from app.tickflow.client import get_client
@@ -319,9 +319,9 @@ def sync_and_persist_etf_daily(
     end_time = end_date or datetime.now()
     start_time = start_date or (end_time - timedelta(days=365))
 
-    total_rows = 0
     chunks = chunked(symbols, batch_size)
     factors = _load_etf_factors(repo)
+    raw_parts: list[pl.DataFrame] = []
     for i, chunk in enumerate(chunks):
         sleep_between_batches(i, limit.rpm)
         raw = kline_sync.sync_daily_batch(
@@ -331,19 +331,56 @@ def sync_and_persist_etf_daily(
             start_time=start_time,
             end_time=end_time,
         )
-        if raw.is_empty():
-            continue
-
-        repo.append_etf_daily(raw)
-        batch_factors = factors.filter(pl.col("symbol").is_in(chunk)) if not factors.is_empty() else factors
-        # ETF 使用复权和通用技术指标；不传 instruments，避免套用 A股涨跌停/连板逻辑。
-        enriched = compute_enriched(raw, factors=batch_factors, instruments=None)
-        repo.append_etf_enriched(enriched)
-        total_rows += raw.height
-        logger.info("etf daily synced: %d/%d chunks, +%d rows", i + 1, len(chunks), raw.height)
+        if not raw.is_empty():
+            raw_parts.append(raw)
+        logger.info("etf daily fetched: %d/%d chunks, +%d rows", i + 1, len(chunks), raw.height)
         if on_chunk_done:
             on_chunk_done(i + 1, len(chunks))
-        del raw, enriched
+
+    if not raw_parts:
+        repo.refresh_index_views()
+        return 0
+
+    # 每个批次都包含相同日期范围。先合并再落盘, 避免同一日期分区被连续替换,
+    # 也避免 Windows 上状态查询读取 parquet 时与下一批写入争抢文件句柄。
+    raw = (
+        pl.concat(raw_parts, how="diagonal_relaxed")
+        .unique(subset=["symbol", "date"], keep="last")
+        .sort(["symbol", "date"])
+    )
+    repo.append_etf_daily(raw)
+    total_rows = raw.height
+    del raw
+    gc.collect()
+
+    # 逐 API 批次计算指标并立即裁剪到落盘窄表, 防止数百万行完整指标同时驻留内存。
+    storage_parts: list[pl.DataFrame] = []
+    for i, raw_part in enumerate(raw_parts):
+        batch_symbols = raw_part["symbol"].unique().to_list()
+        batch_factors = (
+            factors.filter(pl.col("symbol").is_in(batch_symbols))
+            if not factors.is_empty()
+            else factors
+        )
+        # ETF 不传 instruments, 避免套用 A 股涨跌停和连板逻辑。
+        enriched = compute_enriched(raw_part, factors=batch_factors, instruments=None)
+        storage_cols = [column for column in ENRICHED_STORAGE_COLS if column in enriched.columns]
+        if not enriched.is_empty() and storage_cols:
+            storage_parts.append(enriched.select(storage_cols))
+        raw_parts[i] = pl.DataFrame()
+        del enriched, raw_part
         gc.collect()
+
+    if storage_parts:
+        enriched_storage = (
+            pl.concat(storage_parts, how="diagonal_relaxed")
+            .unique(subset=["symbol", "date"], keep="last")
+            .sort(["symbol", "date"])
+        )
+        repo.append_etf_enriched(enriched_storage)
+        del enriched_storage
+    logger.info("etf daily persisted: %d rows", total_rows)
+    del raw_parts, storage_parts
+    gc.collect()
     repo.refresh_index_views()
     return total_rows

@@ -1764,7 +1764,16 @@ class KlineRepository:
         """
         tmp = out.with_name(out.name + ".tmp")
         df.write_parquet(tmp)
-        tmp.replace(out)  # 同目录 rename, POSIX/NTFS 均为原子操作
+        for attempt in range(20):
+            try:
+                tmp.replace(out)  # 同目录 rename, POSIX/NTFS 均为原子操作
+                return
+            except PermissionError:
+                if attempt == 19:
+                    raise
+                if attempt == 0:
+                    logger.warning("parquet 文件正被占用, 等待后重试替换: %s", out)
+                time.sleep(min(0.05 * (attempt + 1), 0.5))
 
     def _write_daily_partition(self, df: pl.DataFrame, table: str) -> None:
         """按 date 分区写入 parquet，每个日期一个文件，支持 merge-upsert。"""

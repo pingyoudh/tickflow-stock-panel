@@ -615,7 +615,13 @@ async def sync_minute(request: Request):
     """
     import asyncio
 
-    from app.services.pipeline_jobs import job_store, release_run_slot, try_acquire_run_slot, LONG_JOB_TIMEOUT_S
+    from app.services.pipeline_jobs import (
+        LONG_JOB_STALL_TIMEOUT_S,
+        LONG_JOB_TIMEOUT_S,
+        job_store,
+        release_run_slot,
+        try_acquire_run_slot,
+    )
     from app.api.data import invalidate_storage_cache
     from app.services.preferences import get_minute_sync_days
     from app.tickflow.capabilities import Cap
@@ -637,8 +643,11 @@ async def sync_minute(request: Request):
     override_days = body.get("days")
     extend_flag = body.get("extend")
 
-    # 分钟K全市场同步是长任务(数据量是日K的 ~240 倍),用更宽松的卡死阈值
-    job_id, is_new = job_store.create(timeout_s=LONG_JOB_TIMEOUT_S)
+    # 分钟K全市场同步是长任务: 用较长总上限, 同时依靠进度心跳识别真卡死。
+    job_id, is_new = job_store.create(
+        timeout_s=LONG_JOB_TIMEOUT_S,
+        stall_timeout_s=LONG_JOB_STALL_TIMEOUT_S,
+    )
     if not is_new:
         return {"status": "reused", "job_id": job_id}
 
@@ -843,6 +852,80 @@ async def extend_history(request: Request):
     except Exception as e:
         logger.error("extend_history error: %s\n%s", e, _tb.format_exc())
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@router.post("/extend_etf_history")
+async def extend_etf_history(request: Request):
+    """向前扩展 ETF 历史日K、复权因子与技术指标。"""
+    import asyncio
+
+    body = await request.json()
+    value = body.get("value")
+    unit = body.get("unit", "year")
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise HTTPException(status_code=400, detail="value 必须为正整数")
+    if unit not in ("month", "year"):
+        raise HTTPException(status_code=400, detail="unit 只支持 month/year")
+
+    repo = request.app.state.repo
+    capset = request.app.state.capabilities
+    from app.tickflow.capabilities import Cap
+    if not capset.has(Cap.KLINE_DAILY_BATCH):
+        raise HTTPException(status_code=403, detail="需要 Pro+ 权限 (batch K-line)")
+
+    from app.api.data import invalidate_storage_cache
+    from app.services.extend_etf_history import run_extend_etf_history
+    from app.services.pipeline_jobs import job_store, release_run_slot, try_acquire_run_slot
+
+    # ETF 全市场多年历史可能明显长于普通盘后任务。
+    job_id, is_new = job_store.create(timeout_s=6 * 60 * 60)
+    if not is_new:
+        return {"status": "reused", "job_id": job_id}
+
+    qs = getattr(request.app.state, "quote_service", None)
+
+    async def task() -> None:
+        if not try_acquire_run_slot():
+            job_store.fail(job_id, "已有数据任务在运行(或上一次任务卡死未结束),请稍后再试")
+            return
+        loop = asyncio.get_event_loop()
+
+        def progress(
+            stage: str,
+            pct: int,
+            msg: str,
+            stage_pct: int | None = None,
+            skip_log: bool = False,
+        ) -> None:
+            job_store.progress(
+                job_id, stage, pct, msg, stage_pct=stage_pct, skip_log=skip_log
+            )
+
+        def run() -> dict:
+            if qs:
+                with qs.paused():
+                    return run_extend_etf_history(
+                        repo, capset, value, unit, on_progress=progress
+                    )
+            return run_extend_etf_history(repo, capset, value, unit, on_progress=progress)
+
+        try:
+            job_store.start(job_id)
+            result = await loop.run_in_executor(_long_task_executor, run)
+            if "error" in result:
+                job_store.fail(job_id, result["error"])
+            else:
+                job_store.succeed(job_id, result)
+            invalidate_storage_cache()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("extend_etf_history failed: job_id=%s", job_id)
+            job_store.fail(job_id, str(exc))
+            invalidate_storage_cache()
+        finally:
+            release_run_slot()
+
+    asyncio.create_task(task())
+    return {"status": "started", "job_id": job_id}
 
 
 @router.post("/repair_daily")

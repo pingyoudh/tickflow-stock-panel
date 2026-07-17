@@ -421,8 +421,11 @@ def run_now(
                         adj_end = datetime.now()
                         adj_path = repo.store.data_dir / "adj_factor_etf" / "all.parquet"
                         fallback_start = adj_end - timedelta(days=30)
-                        adj_start = fallback_start
-                        if adj_path.exists():
+                        adj_start = (
+                            _dt.combine(override_start_date, _dt.min.time())
+                            if override_start_date else fallback_start
+                        )
+                        if adj_path.exists() and not override_start_date:
                             max_date = pl.scan_parquet(adj_path).select(pl.col("trade_date").max()).collect().item()
                             if max_date is not None:
                                 if isinstance(max_date, str):
@@ -448,7 +451,11 @@ def run_now(
                     d.name[5:] for d in etf_dir.glob("date=*")
                     if d.is_dir() and d.name.startswith("date=")
                 ) if etf_dir.exists() else []
-                etf_start = _date.fromisoformat(etf_dates[-1]) if etf_dates else today - _td(days=365)
+                etf_start = (
+                    override_start_date
+                    if override_start_date
+                    else (_date.fromisoformat(etf_dates[-1]) if etf_dates else today - _td(days=365))
+                )
 
                 def _etf_chunk(cur: int, tot: int) -> None:
                     emit("sync_index", 88, f"ETF 日K批次 {cur}/{tot}",

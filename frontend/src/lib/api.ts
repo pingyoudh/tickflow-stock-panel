@@ -891,9 +891,298 @@ export interface StrategyAlertEvent {
   [key: string]: unknown
 }
 
+// ===== Quant / ML research =====
+export interface QuantFactor {
+  id: string
+  name: string
+  description: string
+  family: string
+  version: string
+  authoring_type: 'builtin' | 'declarative' | 'python' | 'model'
+  asset_types: ('stock' | 'etf')[]
+  trusted: boolean
+  readonly: boolean
+  point_in_time: boolean
+}
+
+export interface MLModelSpec {
+  id: string
+  name: string
+  algorithm: MLAlgorithm
+  asset_type: 'stock' | 'etf'
+  symbols: string[] | null
+  features: string[]
+  feature_versions?: Record<string, string>
+  start: string
+  end: string
+  target: { horizon: 1 | 5 | 10 | 20; benchmark_mode: 'index' | 'cross_section_mean'; benchmark_symbol: string | null }
+  walk_forward: { train_days: number; validation_days: number; test_days: number; step_days: number }
+  tuning: { enabled: boolean; max_trials: number }
+  device: 'auto' | 'cpu' | 'gpu'
+  params: Record<string, unknown>
+  seed: number
+  universe_filters: Record<string, unknown>
+}
+
+export type MLAlgorithm = 'elastic_net' | 'lightgbm' | 'xgboost'
+
+export interface FactorRef {
+  id: string
+  version: string
+}
+
+export interface MLSearchSpec {
+  id: string
+  name: string
+  asset_type: 'stock' | 'etf'
+  symbols: string[] | null
+  start: string
+  end: string
+  target: MLModelSpec['target']
+  factor_pool: FactorRef[]
+  required_factors: FactorRef[]
+  excluded_factors: FactorRef[]
+  algorithms: MLAlgorithm[]
+  budget: 'quick' | 'standard' | 'overnight'
+  min_features: number
+  max_features: number
+  shortlist_limit: number
+  inner_folds: number
+  inner_validation_days: number
+  walk_forward: MLModelSpec['walk_forward']
+  costs: {
+    top_n: number
+    commission_pct: number
+    stamp_tax_pct: number
+    slippage_bps: number
+  }
+  device: 'auto' | 'cpu' | 'gpu'
+  seed: number
+  universe_filters: Record<string, unknown>
+}
+
+export interface MLSearchEstimate {
+  estimated_rows: number
+  factor_count: number
+  outer_folds: number
+  search_trials_per_window: number
+  estimated_model_fits: number
+  estimated_hours: number
+  warnings: string[]
+}
+
+export interface QuantExperiment {
+  run_id: string
+  kind: string
+  status: 'queued' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled'
+  created_at: string
+  updated_at: string
+  progress: number
+  message: string
+  spec: Record<string, any>
+  result: Record<string, any>
+  error: string | null
+  warnings: string[]
+  input_changed?: boolean
+}
+
+export interface QuantModel {
+  version: string
+  model_id: string
+  name: string
+  algorithm: MLAlgorithm
+  status: 'trained' | 'validated' | 'published' | 'archived'
+  created_at: string
+  published_at: string | null
+  spec: MLModelSpec
+  metrics: Record<string, number | null>
+  training: { actual_devices: string[]; library_versions: string[]; training_seconds: number; warnings: string[] }
+  diagnostic?: MLDiagnostic
+  latest_backtest?: { run_id: string; metrics: MLBacktestMetrics; created_at: string } | null
+  latest_prediction?: PredictionDateSummary | null
+}
+
+export type MLGrade = 'robust' | 'candidate' | 'weak' | 'invalid' | 'unverified'
+
+export interface MLDiagnosticDimension {
+  status: 'green' | 'yellow' | 'red'
+  reason: string
+  [key: string]: unknown
+}
+
+export interface MLDiagnostic {
+  grade: MLGrade
+  dimensions: Record<'data' | 'statistics' | 'stability' | 'economics', MLDiagnosticDimension>
+  warnings: string[]
+  publish_warning: boolean
+}
+
+export interface MLBacktestSpec {
+  model_version: string
+  top_n: number
+  rebalance_days: number | null
+  weighting: 'equal' | 'score'
+  initial_capital: number
+  commission_pct: number
+  stamp_tax_pct: number
+  slippage_bps: number
+}
+
+export interface MLBacktestMetrics {
+  total_return: number
+  annual_return: number
+  sharpe: number
+  sortino: number
+  max_drawdown: number
+  calmar: number
+  index_total_return: number
+  universe_total_return: number
+  excess_vs_index: number
+  excess_vs_universe: number
+  win_rate: number
+  trade_count: number
+  total_cost: number
+  average_turnover: number
+  oos_trading_days: number
+  monthly_returns: { month: string; return: number }[]
+}
+
+export interface MLEquityPoint {
+  date: string
+  value: number
+  cash: number
+  drawdown: number
+  index_benchmark: number | null
+  universe_benchmark: number | null
+}
+
+export interface MLBacktestHolding {
+  date: string
+  symbol: string
+  name: string
+  shares: number
+  market_value: number
+  weight: number
+}
+
+export interface MLBacktestTrade {
+  date: string
+  signal_date?: string | null
+  symbol: string
+  name: string
+  side: 'buy' | 'sell'
+  price: number
+  shares: number
+  gross_value: number
+  cost: number
+  pnl?: number | null
+}
+
+export interface PredictionDateSummary {
+  date: string
+  rows: number
+  coverage: number
+  prediction_min: number
+  prediction_max: number
+  prediction_mean: number
+  psi?: number | null
+  warnings?: string[]
+}
+
+export interface MLPredictionRow {
+  symbol: string
+  name?: string | null
+  date: string
+  model_version: string
+  prediction: number
+  rank: number
+  feature_coverage: number
+}
+
+export interface QuantModelDetail extends Omit<QuantModel, 'latest_backtest'> {
+  training_run: QuantExperiment | null
+  backtests: QuantExperiment[]
+  latest_backtest: QuantExperiment | null
+  prediction_dates: PredictionDateSummary[]
+  diagnostic: MLDiagnostic
+}
+
+export interface QuantStrategy {
+  id: string
+  name: string
+  asset_type: 'stock' | 'etf'
+  symbols: string[] | null
+  factors: { factor_id: string; factor_version: string; weight: number }[]
+  candidate_mode: 'threshold' | 'top_n'
+  score_threshold: number | null
+  top_n: number
+  rebalance: 'daily' | 'weekly' | 'monthly'
+  entry_rule: 'next_open'
+  exit_rule: 'rebalance' | 'score_below_threshold'
+}
+
+export interface MLCapabilities {
+  gpu: { available: boolean; name?: string; memory_mb?: number; driver?: string; reason?: string }
+  cpu_threads: number
+  algorithms: Record<string, { installed: boolean; version: string | null; gpu_backend: string; gpu_candidate: boolean }>
+  sklearn: { installed: boolean; version: string | null }
+  optuna: { installed: boolean; version: string | null }
+  joblib: { installed: boolean; version: string | null }
+}
+
 // ===== API surface =====
 export const api = {
   health: () => request<{ status: string; version: string; mode: string }>('/health'),
+
+  quantFactors: () => request<{ factors: QuantFactor[] }>('/api/quant/factors'),
+  quantMLCapabilities: () => request<MLCapabilities>('/api/quant/ml/capabilities'),
+  quantMLSpecs: () => request<{ specs: MLModelSpec[] }>('/api/quant/ml/specs'),
+  quantSaveMLSpec: (spec: MLModelSpec) => request<MLModelSpec>('/api/quant/ml/specs', {
+    method: 'POST', body: JSON.stringify(spec),
+  }),
+  quantTrain: (spec: MLModelSpec) => request<QuantExperiment>('/api/quant/ml/train', {
+    method: 'POST', body: JSON.stringify({ spec }),
+  }),
+  quantSearchEstimate: (spec: MLSearchSpec) => request<MLSearchEstimate>('/api/quant/ml/search/estimate', {
+    method: 'POST', body: JSON.stringify(spec),
+  }),
+  quantSearch: (spec: MLSearchSpec) => request<QuantExperiment>('/api/quant/ml/searches', {
+    method: 'POST', body: JSON.stringify(spec),
+  }),
+  quantExperiments: () => request<{ experiments: QuantExperiment[] }>('/api/quant/experiments'),
+  quantCancelExperiment: (runId: string) => request<QuantExperiment>(`/api/quant/experiments/${encodeURIComponent(runId)}/cancel`, { method: 'POST' }),
+  quantRerunExperiment: (runId: string) => request<QuantExperiment>(`/api/quant/experiments/${encodeURIComponent(runId)}/rerun`, { method: 'POST' }),
+  quantDeleteExperiment: (runId: string) => request<{ deleted: boolean }>(`/api/quant/experiments/${encodeURIComponent(runId)}`, { method: 'DELETE' }),
+  quantModels: () => request<{ models: QuantModel[] }>('/api/quant/ml/models'),
+  quantModelDetail: (version: string) => request<QuantModelDetail>(`/api/quant/ml/models/${encodeURIComponent(version)}`),
+  quantPublishModel: (version: string) => request<QuantModel>(`/api/quant/ml/models/${encodeURIComponent(version)}/publish`, { method: 'POST' }),
+  quantArchiveModel: (version: string) => request<QuantModel>(`/api/quant/ml/models/${encodeURIComponent(version)}/archive`, { method: 'POST' }),
+  quantGeneratePredictions: (version: string) => request<Record<string, any>>(`/api/quant/ml/models/${encodeURIComponent(version)}/predictions`, { method: 'POST' }),
+  quantModelBacktest: (version: string, spec: MLBacktestSpec) => request<QuantExperiment>(`/api/quant/ml/models/${encodeURIComponent(version)}/backtests`, {
+    method: 'POST', body: JSON.stringify(spec),
+  }),
+  quantModelPredictions: (version: string, targetDate?: string, search = '', limit = 200, offset = 0) => {
+    const params = new URLSearchParams({ search, limit: String(limit), offset: String(offset) })
+    if (targetDate) params.set('target_date', targetDate)
+    return request<{ predictions: MLPredictionRow[]; total: number; date: string | null; summary: PredictionDateSummary | null }>(`/api/quant/ml/models/${encodeURIComponent(version)}/predictions?${params}`)
+  },
+  quantPredictionDates: (version: string) => request<{ dates: PredictionDateSummary[] }>(`/api/quant/ml/models/${encodeURIComponent(version)}/prediction-dates`),
+  quantStrategies: () => request<{ strategies: QuantStrategy[] }>('/api/quant/strategies'),
+  quantSaveStrategy: (spec: QuantStrategy) => request<QuantStrategy>('/api/quant/strategies', {
+    method: 'POST', body: JSON.stringify(spec),
+  }),
+  quantDeleteStrategy: (id: string) => request<{ deleted: boolean }>(`/api/quant/strategies/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  quantOptimizePortfolio: (payload: {
+    model_version: string
+    objective: 'equal' | 'score_weight' | 'min_variance' | 'max_sharpe' | 'min_tracking_error'
+    max_positions: number
+    max_weight: number
+    industry_cap: number
+    turnover_cap: number
+    benchmark_symbol?: string | null
+  }) => request<{ date: string; model_version: string; weights: Record<string, number>; objective: string; success: boolean; warnings: string[] }>('/api/quant/portfolio/optimize', {
+    method: 'POST', body: JSON.stringify(payload),
+  }),
 
   // ===== Auth (访问认证) =====
   authStatus: () =>
@@ -1297,6 +1586,11 @@ export const api = {
     }),
   extendHistory: (value: number, unit: 'day' | 'month' | 'year') =>
     request<{ status: string; job_id: string }>('/api/kline/extend_history', {
+      method: 'POST',
+      body: JSON.stringify({ value, unit }),
+    }),
+  extendEtfHistory: (value: number, unit: 'month' | 'year') =>
+    request<{ status: string; job_id: string }>('/api/kline/extend_etf_history', {
       method: 'POST',
       body: JSON.stringify({ value, unit }),
     }),

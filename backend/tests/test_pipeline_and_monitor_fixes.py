@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import polars as pl
 import pytest
 
@@ -11,6 +13,12 @@ from app.services import pipeline_jobs
 from app.services.pipeline_jobs import JobStore
 from app.strategy import monitor_rules
 from app.strategy.monitor import MonitorRuleEngine
+
+
+def _utc_ago(seconds: int) -> str:
+    return (
+        datetime.now(timezone.utc) - timedelta(seconds=seconds)
+    ).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 # ── JobStore 单飞 ────────────────────────────────────────────────────────
@@ -59,6 +67,40 @@ def test_run_slot_is_exclusive():
     pipeline_jobs.release_run_slot()
     # 重复释放幂等, 不抛
     pipeline_jobs.release_run_slot()
+
+
+def test_reap_stale_keeps_long_job_with_recent_progress(tmp_path):
+    """长任务即使已跑较久,只要最近仍有进度,不应被误判为卡死。"""
+    store = JobStore(store_dir=tmp_path / "jobs")
+    jid, _ = store.create(timeout_s=3600, stall_timeout_s=60)
+    store.start(jid)
+
+    with store._lock:
+        job = store._active_jobs[jid]
+        job["started_at"] = _utc_ago(1800)
+        job["last_progress_at"] = _utc_ago(5)
+
+    store.reap_stale()
+
+    assert store.get(jid)["status"] == "running"
+
+
+def test_reap_stale_fails_long_job_without_progress(tmp_path):
+    """长任务超过无进度阈值时应自动失败,便于用户重试。"""
+    store = JobStore(store_dir=tmp_path / "jobs")
+    jid, _ = store.create(timeout_s=3600, stall_timeout_s=60)
+    store.start(jid)
+
+    with store._lock:
+        job = store._active_jobs[jid]
+        job["started_at"] = _utc_ago(1800)
+        job["last_progress_at"] = _utc_ago(120)
+
+    store.reap_stale()
+
+    job = store.get(jid)
+    assert job["status"] == "failed"
+    assert "无进度" in job["error"]
 
 
 # ── 监控 sector fail-closed ──────────────────────────────────────────────

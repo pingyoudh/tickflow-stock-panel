@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 from datetime import datetime, timedelta
 
@@ -34,7 +35,16 @@ def _atomic_write_parquet(df: pl.DataFrame, out) -> None:
     """
     tmp = out.with_name(out.name + ".tmp")
     df.write_parquet(tmp)
-    tmp.replace(out)  # 同目录 rename, POSIX/NTFS 均为原子操作
+    for attempt in range(20):
+        try:
+            tmp.replace(out)  # 同目录 rename, POSIX/NTFS 均为原子操作
+            return
+        except PermissionError:
+            if attempt == 19:
+                raise
+            if attempt == 0:
+                logger.warning("parquet 文件正被占用, 等待后重试替换: %s", out)
+            time.sleep(min(0.05 * (attempt + 1), 0.5))
 
 
 # 标准列(无论 SDK 返回什么形状,我们把它规范成这套)

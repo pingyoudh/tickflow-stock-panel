@@ -95,6 +95,7 @@ class Settings(BaseSettings):
     port: int = 3018
     log_level: str = "INFO"
     backtest_range_guard: bool = False
+    quant_max_panel_rows: int = Field(default=10_000_000, ge=1)
 
     # Auth — 首次启动时预置访问密码(明文, 仅用于初始化, 详见 services/auth.bootstrap_from_env)
     # 公网服务器部署时免去 SSH 端口转发设密码的麻烦。写入 auth.json(哈希)后即不再读取。

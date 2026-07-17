@@ -46,6 +46,8 @@ import {
   Moon,
   X,
   WifiOff,
+  BrainCircuit,
+  Menu,
 } from 'lucide-react'
 import { Logo } from './Logo'
 import { api, type IndexQuote } from '@/lib/api'
@@ -71,6 +73,7 @@ const nav = [
   { to: '/watchlist',  label: '自选',   icon: Star },
   { to: '/screener',   label: '策略',   icon: ScanSearch },
   { to: '/backtest',   label: '回测',   icon: History },
+  { to: '/quant',      label: '量化研究', icon: BrainCircuit },
   { to: '/stock-analysis',    label: '个股分析', icon: TrendingUp },
   { to: '/limit-ladder', label: '连板梯队', icon: Flame },
   { to: '/concept-analysis', label: '概念分析', icon: Layers3 },
@@ -274,6 +277,7 @@ function AIConfigBadge({ configured, model }: { configured?: boolean; model?: st
 }
 
 export function Layout() {
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   // ===== 共享 hooks (替代内联 useQuery) =====
   const { data: caps } = useCapabilities()
   const { data: settingsState } = useSettings()
@@ -422,8 +426,40 @@ export function Layout() {
   }
 
   return (
-    <div className="h-screen grid grid-cols-[14rem_1fr] bg-base text-foreground overflow-hidden">
-      <aside className="border-r border-border bg-surface flex flex-col h-full min-h-0 overflow-hidden">
+    <div className="relative grid h-screen grid-cols-1 overflow-hidden bg-base text-foreground md:grid-cols-[14rem_1fr]">
+      <div className="fixed inset-x-0 top-0 z-30 flex h-11 items-center justify-between border-b border-border bg-surface px-3 md:hidden">
+        <div className="flex items-center gap-2 font-mono text-xs font-bold">
+          <Logo size={22} style={{ color: BRAND }} />
+          <span>TickFlow</span>
+        </div>
+        <button
+          type="button"
+          onClick={() => setMobileSidebarOpen(true)}
+          className="flex h-8 w-8 items-center justify-center rounded-btn text-foreground/80 hover:bg-elevated hover:text-foreground"
+          aria-label="打开导航"
+          aria-controls="app-sidebar"
+          aria-expanded={mobileSidebarOpen}
+        >
+          <Menu className="h-4 w-4" />
+        </button>
+      </div>
+
+      {mobileSidebarOpen && (
+        <button
+          type="button"
+          className="fixed inset-0 z-40 bg-black/60 md:hidden"
+          onClick={() => setMobileSidebarOpen(false)}
+          aria-label="关闭导航"
+        />
+      )}
+
+      <aside
+        id="app-sidebar"
+        className={cn(
+          'fixed inset-y-0 left-0 z-50 flex h-full w-56 min-h-0 flex-col overflow-hidden border-r border-border bg-surface transition-transform duration-200 md:static md:z-auto md:w-auto md:translate-x-0',
+          mobileSidebarOpen ? 'translate-x-0' : '-translate-x-full',
+        )}
+      >
         <div className="px-5 py-5 border-b border-border shrink-0">
           {/* Brand block — 原创 logo + 等宽 wordmark */}
           <div className="flex items-center gap-2.5">
@@ -465,6 +501,7 @@ export function Layout() {
             <NavLink
               key={to}
               to={to}
+              onClick={() => setMobileSidebarOpen(false)}
               className={({ isActive }) =>
                 cn(
                   'flex items-center gap-3 px-3 py-2 rounded-btn text-sm transition-colors duration-150 ease-smooth',
@@ -663,7 +700,7 @@ export function Layout() {
         initial={{ opacity: 0, y: 8 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.25, ease: [0.16, 1, 0.3, 1] }}
-        className="h-full overflow-auto scrollbar-gutter-stable"
+        className="h-full overflow-auto pt-11 scrollbar-gutter-stable md:pt-0"
       >
         {streamStatus === 'reconnecting' && (
           <div

@@ -29,11 +29,12 @@ JobStatus = Literal["pending", "running", "succeeded", "failed"]
 #
 # 超时阈值按任务类型区分:
 #   - 普通任务(日K管道/扩展/修正/重算): 1200s (20 分钟)
-#   - 长任务(分钟K全市场同步,数据量是日K的 ~240 倍): 1800s (30 分钟)
-# 分钟K即使流式落盘后仍可能跑十几到数十分钟(限速 sleep 是主因),
-# 用 600s 会误杀正常任务并留下写盘僵尸线程。
+#   - 长任务(分钟K全市场同步,数据量是日K的 ~240 倍): 6h 总上限,
+#     另用 30min 无进度阈值判断是否疑似卡死。
+# 分钟K即使流式落盘后仍可能跑十几到数十分钟(限速 sleep 是主因)。
 DEFAULT_JOB_TIMEOUT_S = 1200
-LONG_JOB_TIMEOUT_S = 1800
+LONG_JOB_TIMEOUT_S = 6 * 60 * 60
+LONG_JOB_STALL_TIMEOUT_S = 30 * 60
 # 向后兼容: 旧调用方引用 STALE_JOB_TIMEOUT_S
 STALE_JOB_TIMEOUT_S = DEFAULT_JOB_TIMEOUT_S
 
@@ -105,7 +106,11 @@ class JobStore:
 
     # ===== lifecycle =====
 
-    def create(self, timeout_s: int = DEFAULT_JOB_TIMEOUT_S) -> tuple[str, bool]:
+    def create(
+        self,
+        timeout_s: int = DEFAULT_JOB_TIMEOUT_S,
+        stall_timeout_s: int | None = None,
+    ) -> tuple[str, bool]:
         """单飞创建任务。返回 (job_id, is_new)。
 
         去重条件为 **pending ∨ running**(而非仅 running):`/run` 先 create() 再在
@@ -115,8 +120,10 @@ class JobStore:
 
         is_new=False 表示复用了已有活跃任务,调用方**不得**再调度新的后台任务。
 
-        timeout_s: reap_stale 判定卡死的阈值。普通任务默认 1200s;
-            分钟K全市场同步等长任务传 LONG_JOB_TIMEOUT_S (1800s)。
+        timeout_s: reap_stale 判定任务运行总时长上限。普通任务默认 1200s;
+            分钟K全市场同步等长任务传 LONG_JOB_TIMEOUT_S (6h)。
+        stall_timeout_s: 可选的无进度卡死阈值。设置后,progress() 会刷新
+            last_progress_at, 有进度的长任务不会仅因总耗时较长被误杀。
         """
         with self._lock:
             if self._active_id:
@@ -138,6 +145,8 @@ class JobStore:
                 "result": None,
                 "error": None,
                 "timeout_s": timeout_s,
+                "stall_timeout_s": stall_timeout_s,
+                "last_progress_at": None,
             }
             self._active_id = job_id
             return job_id, True
@@ -147,8 +156,10 @@ class JobStore:
             j = self._active_jobs.get(job_id)
             if not j:
                 return
+            now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
             j["status"] = "running"
-            j["started_at"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+            j["started_at"] = now
+            j["last_progress_at"] = now
 
     def succeed(self, job_id: str, result: Any) -> None:
         with self._lock:
@@ -198,6 +209,7 @@ class JobStore:
                 "stage": stage,
                 "msg": msg,
             }
+            j["last_progress_at"] = entry["ts"]
             if skip_log:
                 entry["_skip"] = True
             if skip_log and j["log"] and j["log"][-1].get("stage") == stage and j["log"][-1].get("_skip"):
@@ -245,8 +257,8 @@ class JobStore:
         不在此处理:它们没有 active_id,只能靠 executor 线程自然结束或进程重启。
 
         timeout_s: 显式覆盖。None 时用 job 自身 create() 时存的 timeout_s,
-        缺失则回退 DEFAULT_JOB_TIMEOUT_S。分钟K长任务在 create 时存了更大阈值,
-        不被普通任务的 1200s 误杀。
+        缺失则回退 DEFAULT_JOB_TIMEOUT_S。分钟K长任务在 create 时存了更大总上限,
+        并通过 last_progress_at 判断无进度卡死,避免有进度时被误杀。
         """
         with self._lock:
             jid = self._active_id
@@ -260,18 +272,49 @@ class JobStore:
                 return
             # 优先用显式传入, 其次 job 自身阈值, 最后默认值
             effective_timeout = timeout_s if timeout_s is not None else j.get("timeout_s", DEFAULT_JOB_TIMEOUT_S)
+            stall_timeout = j.get("stall_timeout_s")
+            last_progress_at = j.get("last_progress_at") or started
+        try:
+            effective_timeout = int(effective_timeout)
+        except (TypeError, ValueError):
+            effective_timeout = DEFAULT_JOB_TIMEOUT_S
+        try:
+            stall_timeout = int(stall_timeout) if stall_timeout is not None else None
+        except (TypeError, ValueError):
+            stall_timeout = None
         # 时间计算放到锁外(避免 datetime 解析持锁)。
         # started_at 形如 "2026-07-04T12:00:00Z"(start() 用 datetime.utcnow 存)。
         # 两端都用 timezone-aware UTC 比较,避免 naive/aware 混用导致 TypeError。
         try:
             start_dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
-            elapsed = (datetime.now(start_dt.tzinfo) - start_dt).total_seconds()
+            now = datetime.now(start_dt.tzinfo)
+            elapsed = (now - start_dt).total_seconds()
         except Exception:  # noqa: BLE001
             return
-        if elapsed > effective_timeout:
-            logger.warning("reap_stale: 强制取消卡死 job %s (已运行 %.0fs, 阈值 %ss)",
-                           jid, elapsed, effective_timeout)
-            self.fail(jid, f"超时自动取消 (运行 {int(elapsed)}s, 疑似卡死)")
+        reason: str | None = None
+        idle: float | None = None
+        if stall_timeout is not None:
+            try:
+                last_progress_dt = datetime.fromisoformat(str(last_progress_at).replace("Z", "+00:00"))
+                idle = (now - last_progress_dt).total_seconds()
+            except Exception:  # noqa: BLE001
+                idle = None
+            if idle is not None and idle > stall_timeout:
+                reason = f"长时间无进度自动取消 (无进度 {int(idle)}s, 疑似卡死)"
+
+        if reason is None and elapsed > effective_timeout:
+            reason = f"超时自动取消 (运行 {int(elapsed)}s, 疑似卡死)"
+
+        if reason is not None:
+            idle_msg = "" if idle is None else f", 无进度 {idle:.0f}s"
+            logger.warning(
+                "reap_stale: 强制取消卡死 job %s (已运行 %.0fs%s, 阈值 %ss)",
+                jid,
+                elapsed,
+                idle_msg,
+                effective_timeout,
+            )
+            self.fail(jid, reason)
             # 强制释放重任务锁: 卡死的线程无法被中断, 锁永远不会自然释放。
             # job 已标记 failed, 即使僵尸线程后续写入 parquet, 下次拉取会覆盖, 安全。
             try:

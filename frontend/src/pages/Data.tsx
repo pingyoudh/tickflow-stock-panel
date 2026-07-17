@@ -40,6 +40,7 @@ import { SectionTitle, HistoryRow } from '@/components/data/SectionTitle'
 import { SettingsModal } from '@/components/data/SettingsModal'
 import { ScheduleEditor } from '@/components/data/ScheduleEditor'
 import { ExtendHistoryPanel } from '@/components/data/ExtendHistoryPanel'
+import { EtfHistoryPanel } from '@/components/data/EtfHistoryPanel'
 import { RepairDailyPanel } from '@/components/data/RepairDailyPanel'
 import { EnrichedRebuildPanel } from '@/components/data/EnrichedRebuildPanel'
 import { MinuteSyncConfig } from '@/components/data/MinuteSyncConfig'
@@ -321,6 +322,7 @@ export function Data() {
     compute_enriched: 'enriched',
     rebuild_enriched: 'enriched',
     sync_index: 'index_daily',
+    extend_etf_history: 'etf',
     sync_minute: 'minute',
     extend_minute: 'minute',
   }
@@ -477,6 +479,10 @@ export function Data() {
             hint="场内基金 · 独立存储"
             stats={etfOverviewStats}
             loading={isLoading}
+            active={activeCard === 'etf'}
+            done={doneStages.has('etf')}
+            skipped={skippedCards.has('etf')}
+            stagePct={activeCard === 'etf' ? (job.data?.stage_pct ?? 0) : 0}
             tierKey="etf"
             capLimits={caps.data?.capabilities}
             tierLabel={caps.data?.label}
@@ -489,6 +495,8 @@ export function Data() {
               { label: '指标', table: 'etf_enriched' },
             ] as FieldTab[]}
             onShowFields={(t) => setSchemaTable(t ?? 'etf_daily')}
+            onSettings={() => setOpenSettings(v => v === 'etf' ? null : 'etf')}
+            settingsOpen={openSettings === 'etf'}
           />
         )
       case 'minute':
@@ -1078,6 +1086,23 @@ export function Data() {
                 )}
               </div>
             </div>
+          </SettingsModal>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {openSettings === 'etf' && (
+          <SettingsModal title="ETF · 向前扩展历史" onClose={() => setOpenSettings(null)}>
+            <EtfHistoryPanel
+              caps={caps.data}
+              isRunning={!!activeJobId}
+              earliestDate={s?.etf_daily?.earliest_date ?? s?.etf_enriched?.earliest_date ?? null}
+              onStarted={(jobId) => {
+                setActiveJobId(jobId)
+                startTime.current = Date.now()
+                setOpenSettings(null)
+              }}
+            />
           </SettingsModal>
         )}
       </AnimatePresence>
