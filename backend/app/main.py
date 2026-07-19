@@ -11,7 +11,31 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app import __version__
-from app.api import analysis, auth as auth_api, backtest, data, ext_data, financials, indices, intraday, kline, market_recap, monitor_rules, alerts, overview, pipeline, quant, rps, screener, settings as settings_api, signals, stock_analysis, strategy, watchlist
+from app.api import (
+    alerts,
+    analysis,
+    auth as auth_api,
+    backtest,
+    data,
+    ext_data,
+    finance_news,
+    financials,
+    indices,
+    intraday,
+    kline,
+    market_recap,
+    monitor_rules,
+    overview,
+    pipeline,
+    quant,
+    rps,
+    screener,
+    settings as settings_api,
+    signals,
+    stock_analysis,
+    strategy,
+    watchlist,
+)
 from app.api.routes import router as core_router
 from app.config import settings
 from app.jobs import daily_pipeline
@@ -88,10 +112,15 @@ async def lifespan(app: FastAPI):
     depth_service.set_app_state(app.state)
     app.state.depth_service = depth_service
 
+    # 财联社快讯服务: 本地 Parquet 持久化,调度器启动后立即在后台回补/增量同步。
+    from app.services.finance_news import FinanceNewsService
+    finance_news_service = FinanceNewsService(store.data_dir)
+    app.state.finance_news_service = finance_news_service
+
     # 启动调度器(若 enriched 数据为空,首次启动可手动 POST /api/pipeline/run)
     try:
         daily_pipeline.set_app_state(app.state)  # 供 depth_finalize job 访问 depth_service
-        scheduler = daily_pipeline.start_scheduler(repo, capset)
+        scheduler = daily_pipeline.start_scheduler(repo, capset, finance_news_service)
         app.state.scheduler = scheduler
     except Exception as e:  # noqa: BLE001
         logger.warning("scheduler not started: %s", e)
@@ -290,6 +319,7 @@ app.include_router(ext_data.router)
 app.include_router(financials.router)
 app.include_router(stock_analysis.router)
 app.include_router(market_recap.router)
+app.include_router(finance_news.router)
 app.include_router(settings_api.router)
 app.include_router(strategy.router)
 app.include_router(signals.router)

@@ -373,6 +373,54 @@ export interface AiReviewReport {
   created_at: string
 }
 
+// ===== 财联社快讯 =====
+export interface FinanceNewsSubject {
+  subject_id: number
+  subject_name: string
+}
+
+export interface FinanceNewsStock {
+  stock_code: string
+  stock_name: string
+}
+
+export interface FinanceNewsItem {
+  news_id: string
+  source: 'cls'
+  url: string
+  title: string
+  content: string
+  published_at: string
+  modified_at: string
+  level: string
+  recommend: boolean
+  subjects: FinanceNewsSubject[]
+  stocks: FinanceNewsStock[]
+}
+
+export interface FinanceNewsSyncStatus {
+  syncing: boolean
+  backfill_completed: boolean
+  last_success_at: string | null
+  last_error: string | null
+  latest_published_at: string | null
+}
+
+export interface FinanceNewsPage {
+  items: FinanceNewsItem[]
+  next_cursor: string | null
+  has_more: boolean
+  sync_status: FinanceNewsSyncStatus
+}
+
+export interface FinanceNewsRefreshResult {
+  fetched: number
+  inserted: number
+  updated: number
+  latest_published_at: string | null
+  synced_at: string
+}
+
 // ===== Strategy Engine =====
 export interface StrategyParamDef {
   id: string
@@ -1845,7 +1893,13 @@ export const api = {
     ),
 
   dataStatus: () => request<DataStatus>('/api/data/status'),
-  dataClear: () => request<{ deleted_files: number }>('/api/data/clear', { method: 'POST' }),
+  dataClear: () => request<{
+    deleted_files: number
+    deleted_bytes: number
+    cleared_dimension_ids: string[]
+    preserved_categories: DataCategory[]
+    rebuild_scheduled: boolean
+  }>('/api/data/clear', { method: 'POST' }),
   refreshCache: () => request<{ ok: boolean }>('/api/data/refresh-cache', { method: 'POST' }),
   enrichedSchema: (table: string) => request<EnrichedField[]>(`/api/data/schema/${table}`),
 
@@ -2166,6 +2220,16 @@ export const api = {
       try { yield JSON.parse(buf.trim()) } catch { /* ignore */ }
     }
   },
+
+  // ===== 财联社快讯 =====
+  financeNewsList: (limit = 50, cursor?: string) => {
+    const params = new URLSearchParams({ limit: String(limit) })
+    if (cursor) params.set('cursor', cursor)
+    return request<FinanceNewsPage>(`/api/finance-news?${params}`)
+  },
+
+  financeNewsRefresh: () =>
+    request<FinanceNewsRefreshResult>('/api/finance-news/refresh', { method: 'POST' }),
 
   // ===== 大盘复盘 =====
   reviewReportsList: () =>
@@ -2516,6 +2580,31 @@ interface InstrumentsStats {
   named: number
 }
 
+export type DataCategory = 'business' | 'research' | 'system'
+export type DataDimensionState = 'ready' | 'empty' | 'syncing' | 'error'
+
+export interface DataDimensionStatus {
+  id: string
+  label: string
+  category: DataCategory
+  state: DataDimensionState
+  records: number | null
+  files: number
+  parquet_files: number
+  size_mb: number
+  earliest_at: string | null
+  latest_at: string | null
+  last_modified_at: string | null
+  sensitive: boolean
+  children: DataDimensionStatus[]
+  sync?: {
+    mode: 'manual' | 'scheduled' | 'derived'
+    last_success_at: string | null
+    next_run_at: string | null
+    error: string | null
+  }
+}
+
 export interface DataStatus {
   daily: TableStats | null
   enriched: TableStats | null
@@ -2559,6 +2648,17 @@ export interface DataStatus {
     ext_data_files?: number
     ext_data_size_mb?: number
     total_size_mb: number
+    category_totals?: Record<DataCategory, {
+      files: number
+      parquet_files: number
+      size_mb: number
+    }>
+  }
+  dimensions: DataDimensionStatus[]
+  unclassified: {
+    groups: number
+    files: number
+    size_mb: number
   }
   next_pipeline_run: string | null
   next_instruments_run: string | null

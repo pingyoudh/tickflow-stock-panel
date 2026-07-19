@@ -15,6 +15,14 @@ const TABLE_TITLES: Record<string, string> = {
   etf_instruments: 'ETF 维表',
   etf_daily: 'ETF 日 K',
   etf_enriched: 'ETF Enriched',
+  etf_minute: 'ETF 分钟 K',
+  etf_adj_factor: 'ETF 复权因子',
+  depth5: '五档盘口',
+  finance_news: '财联社快讯',
+  financial_metrics: '财务指标',
+  financial_income: '利润表',
+  financial_balance_sheet: '资产负债表',
+  financial_cash_flow: '现金流量表',
 }
 
 function categorize(name: string): string {

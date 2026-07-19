@@ -16,7 +16,7 @@ describe('data page ETF card visibility', () => {
 
     expect(visible.etf).toBe(true)
     expect(visible.minute).toBe(false)
-    expect(storage.dataCardVisibilityVersion.get(0)).toBe(2)
+    expect(storage.dataCardVisibilityVersion.get(0)).toBe(3)
   })
 
   it('respects a user choice made after migration', () => {
@@ -24,5 +24,16 @@ describe('data page ETF card visibility', () => {
     storage.dataCardVisible.set({ etf: false })
 
     expect(getCardVisibility({ 'kline.daily.batch': {} }).etf).toBe(false)
+  })
+
+  it('shows newly registered news and depth cards after migration', () => {
+    storage.dataCardVisibilityVersion.set(2)
+    storage.dataCardVisible.set({ minute: false })
+
+    const visible = getCardVisibility({})
+
+    expect(visible.finance_news).toBe(true)
+    expect(visible.depth5).toBe(true)
+    expect(visible.minute).toBe(false)
   })
 })

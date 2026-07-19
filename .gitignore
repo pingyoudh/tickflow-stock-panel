@@ -89,6 +89,7 @@ docs/zhihu/
 data/strategies/custom/
 
 # ===== 临时 / 调试产物 =====
+.codex_tmp/
 backend._recheck*.py
 backend/_verify*.py
 backend/_desktop_run.log

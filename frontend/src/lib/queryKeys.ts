@@ -79,6 +79,10 @@ export const QK = {
   // AI 大盘复盘
   reviewReports:        ['review-reports'] as const,
 
+  // 财联社快讯
+  financeNews:          ['finance-news'] as const,
+  financeNewsDashboard: ['finance-news', 'dashboard'] as const,
+
   // 概念涨幅轮动矩阵
   rpsRotation:          (days: number) => ['rps-rotation', days] as const,
 } as const

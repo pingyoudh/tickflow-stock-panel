@@ -123,4 +123,9 @@ export const storage = {
   dataCardVisibilityVersion: kv<number>('data-card-visible-version'),
   /** 数据页画像卡片顺序 (卡片key 数组, 长度=卡片总数) */
   dataCardOrder: kv<string[]>('data-card-order'),
+
+  /** 首页重点快讯语音播报开关 */
+  dashboardNewsVoice: kv<boolean>('dashboard-news-voice'),
+  /** 首页已播报/已作为基线处理的重点快讯 ID */
+  dashboardNewsSpokenIds: kv<string[]>('dashboard-news-spoken-ids'),
 } as const

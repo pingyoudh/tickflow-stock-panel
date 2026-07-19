@@ -19,7 +19,7 @@ import {
 } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { EndpointTestDialog } from '@/components/EndpointTestDialog'
-import { api, type ExtDataConfig } from '@/lib/api'
+import { api, type DataDimensionStatus, type ExtDataConfig } from '@/lib/api'
 import {
   useCapabilities,
   useSettings,
@@ -52,6 +52,31 @@ import { Skeleton } from '@/components/data/Skeleton'
 import { ExtDataStatCard } from '@/components/ext-data/ExtDataStatCard'
 import { CreateExtDialog } from '@/components/ext-data/CreateExtDialog'
 import { EditExtDialog } from '@/components/ext-data/EditExtDialog'
+import { NewsDataCard } from '@/components/data/NewsDataCard'
+import { PersistentAssetSections } from '@/components/data/PersistentAssetSections'
+
+function findDimension(
+  dimensions: DataDimensionStatus[] | undefined,
+  id: string,
+): DataDimensionStatus | undefined {
+  for (const dimension of dimensions ?? []) {
+    if (dimension.id === id) return dimension
+    const child = findDimension(dimension.children, id)
+    if (child) return child
+  }
+  return undefined
+}
+
+function dimensionStats(dimension: DataDimensionStatus | undefined) {
+  if (!dimension) return null
+  return {
+    rows: dimension.records ?? 0,
+    earliest_date: dimension.earliest_at,
+    latest_date: dimension.latest_at,
+    symbols_covered: 0,
+    trading_days: 0,
+  }
+}
 
 export function Data() {
   const qc = useQueryClient()
@@ -103,6 +128,14 @@ export function Data() {
       // 数据均已失效, 故广域失效所有 query 令其重取 —— 数据已清空, 全量刷新是正确行为而非误伤。
       qc.invalidateQueries()
       setShowClearConfirm(false)
+    },
+  })
+
+  const refreshNews = useMutation({
+    mutationFn: api.financeNewsRefresh,
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: QK.dataStatus })
+      qc.invalidateQueries({ queryKey: QK.financeNews })
     },
   })
 
@@ -280,6 +313,8 @@ export function Data() {
 
   const s = status.data
   const isLoading = status.isLoading
+  const newsDimension = findDimension(s?.dimensions, 'finance_news')
+  const depthDimension = findDimension(s?.dimensions, 'depth5')
   const isRunning = job.data?.status === 'running' || job.data?.status === 'pending'
   const isStarting = startSync.isPending
   const hasData = !!(s?.instruments?.rows || s?.daily?.rows)
@@ -488,15 +523,45 @@ export function Data() {
             tierLabel={caps.data?.label}
             customProvider={getCustomProviderName('etf')}
             auto={etfAuto}
-            subLabel="维表 · 日K · 指标"
+            subLabel="维表 · 日K · 指标 · 分钟K · 复权"
             fieldTabs={[
               { label: '维表', table: 'etf_instruments' },
               { label: '日K', table: 'etf_daily' },
               { label: '指标', table: 'etf_enriched' },
+              { label: '分钟K', table: 'etf_minute' },
+              { label: '复权', table: 'etf_adj_factor' },
             ] as FieldTab[]}
             onShowFields={(t) => setSchemaTable(t ?? 'etf_daily')}
             onSettings={() => setOpenSettings(v => v === 'etf' ? null : 'etf')}
             settingsOpen={openSettings === 'etf'}
+          />
+        )
+      case 'finance_news':
+        return (
+          <NewsDataCard
+            dimension={newsDimension}
+            loading={isLoading}
+            refreshing={refreshNews.isPending}
+            refreshError={
+              refreshNews.error instanceof Error
+                ? refreshNews.error.message
+                : null
+            }
+            onRefresh={() => refreshNews.mutate()}
+            onShowFields={() => setSchemaTable('finance_news')}
+          />
+        )
+      case 'depth5':
+        return (
+          <StatCard
+            title="五档盘口"
+            hint="盘中修正 · 盘后定版"
+            stats={dimensionStats(depthDimension)}
+            loading={isLoading}
+            active={depthDimension?.state === 'syncing'}
+            auto
+            subLabel="记录 · 涨跌停盘口"
+            onShowFields={() => setSchemaTable('depth5')}
           />
         )
       case 'minute':
@@ -531,6 +596,14 @@ export function Data() {
             capLimits={caps.data?.capabilities}
             tierLabel={caps.data?.label}
             customProvider={getCustomProviderName('financials')}
+            subLabel="指标 · 利润表 · 资产负债表 · 现金流量表"
+            fieldTabs={[
+              { label: '指标', table: 'financial_metrics' },
+              { label: '利润表', table: 'financial_income' },
+              { label: '资产负债表', table: 'financial_balance_sheet' },
+              { label: '现金流量表', table: 'financial_cash_flow' },
+            ] as FieldTab[]}
+            onShowFields={(table) => setSchemaTable(table ?? 'financial_metrics')}
           />
         )
       default:
@@ -545,7 +618,8 @@ export function Data() {
         title="数据"
         subtitle="本地数据画像 · 同步状态 · 历史记录"
         right={
-          <div className="flex items-center gap-3">
+          <div className="max-w-full overflow-x-auto pb-1 sm:overflow-visible sm:pb-0">
+          <div className="flex min-w-max items-center gap-3">
             {!hasData && !isLoading && (
               <span className="text-xs text-accent animate-pulse">首次使用请点击右侧按钮同步数据</span>
             )}
@@ -618,6 +692,7 @@ export function Data() {
               </button>
             </div>
           </div>
+          </div>
         }
       />
 
@@ -684,7 +759,7 @@ export function Data() {
               </div>
             ) : (
               <div className="space-y-2">
-                <div className="flex items-center gap-1.5 text-[10px] text-muted pb-2 border-b border-border/50">
+                <div className="flex items-center gap-1.5 overflow-x-auto whitespace-nowrap text-[10px] text-muted pb-2 border-b border-border/50 [&>*]:shrink-0">
                   <span className="text-accent/60 font-medium">盘前</span>
                   <span>个股维表</span>
                   <span className="text-border">→</span>
@@ -813,7 +888,7 @@ export function Data() {
             </div>
             <div className="space-y-2">
               {isLoading ? (
-                Array.from({ length: 5 }).map((_, i) => (
+                Array.from({ length: 3 }).map((_, i) => (
                   <div key={i} className="flex items-center justify-between">
                     <Skeleton w="w-10" />
                     <div className="flex items-center gap-3">
@@ -823,12 +898,21 @@ export function Data() {
                   </div>
                 ))
               ) : [
-                { label: '个股维表', files: s?.storage.instruments_files, size: s?.storage.instruments_size_mb },
-                { label: '日 K',     files: s?.storage.daily_files,       size: s?.storage.daily_size_mb },
-                { label: '除权因子', files: s?.storage.adj_factor_files,  size: s?.storage.adj_factor_size_mb },
-                { label: 'Enriched', files: s?.storage.enriched_files,    size: s?.storage.enriched_size_mb },
-                { label: '分钟 K',   files: s?.storage.minute_files,      size: s?.storage.minute_size_mb },
-                { label: '财务数据', files: s?.storage.financials_files,   size: s?.storage.financials_size_mb },
+                {
+                  label: '业务数据',
+                  files: s?.storage.category_totals?.business.files,
+                  size: s?.storage.category_totals?.business.size_mb,
+                },
+                {
+                  label: '用户与研究',
+                  files: s?.storage.category_totals?.research.files,
+                  size: s?.storage.category_totals?.research.size_mb,
+                },
+                {
+                  label: '系统资产',
+                  files: s?.storage.category_totals?.system.files,
+                  size: s?.storage.category_totals?.system.size_mb,
+                },
               ].map((item) => (
                 <div key={item.label} className="flex items-center justify-between text-[11px]">
                   <span className="text-muted">{item.label}</span>
@@ -838,21 +922,30 @@ export function Data() {
                   </div>
                 </div>
               ))}
-              {/* 扩展数据 */}
-              {(extConfigs.data && (extConfigs.data.items?.length ?? 0) > 0) && (
+              {!!s?.unclassified.files && (
                 <div className="flex items-center justify-between text-[11px] border-t border-border/50 pt-2 mt-1">
-                  <span className="text-muted">扩展数据</span>
+                  <span className="text-warning">未登记数据</span>
                   <div className="flex items-center gap-3">
-                    <span className="font-mono text-secondary">{s?.storage.ext_data_files ?? extConfigs.data.items.length} 文件</span>
-                    <span className="font-mono text-muted w-16 text-right">
-                      {s?.storage.ext_data_size_mb != null ? `${s.storage.ext_data_size_mb.toFixed(1)} MB` : '—'}
-                    </span>
+                    <span className="font-mono text-secondary">{s.unclassified.files} 文件</span>
+                    <span className="font-mono text-muted w-16 text-right">{s.unclassified.size_mb.toFixed(1)} MB</span>
                   </div>
                 </div>
               )}
             </div>
           </div>
         </div>
+
+        {!!s?.unclassified.groups && (
+          <div className="flex items-start gap-2 rounded-card border border-warning/35 bg-warning/5 px-3 py-2 text-xs">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+            <div className="min-w-0">
+              <div className="font-medium text-warning">发现未登记数据</div>
+              <div className="text-secondary">
+                {s.unclassified.groups} 个目录组 · {s.unclassified.files} 个文件 · {s.unclassified.size_mb.toFixed(2)} MB
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* 数据画像 */}
         <div>
@@ -872,6 +965,8 @@ export function Data() {
             ))}
           </div>
         </div>
+
+        <PersistentAssetSections dimensions={s?.dimensions ?? []} />
 
         {/* 同步历史 */}
         <div>
@@ -1132,7 +1227,7 @@ export function Data() {
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.97, y: 8 }}
               transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-              className="relative w-[90vw] max-w-[420px] rounded-card border border-border bg-base shadow-2xl p-6"
+              className="relative w-[90vw] max-w-[500px] rounded-card border border-border bg-base shadow-2xl p-6"
             >
               <div className="flex items-start gap-3">
                 <div className="shrink-0 h-10 w-10 rounded-full bg-danger/12 flex items-center justify-center">
@@ -1141,19 +1236,21 @@ export function Data() {
                 <div className="min-w-0">
                   <h3 className="text-sm font-semibold text-foreground mb-1.5">确认清除本地数据？</h3>
                   <p className="text-xs text-secondary leading-relaxed">
-                    此操作将<span className="text-danger font-medium">永久删除</span>所有已同步的本地数据，包括：
+                    本次操作只重置业务数据，研究成果和系统设置不会被删除。
                   </p>
-                  <ul className="mt-2 text-[11px] text-muted leading-relaxed space-y-0.5">
-                    <li>· 个股维表、日 K、除权因子</li>
-                    <li>· Enriched 指标数据、分钟 K</li>
-                    <li>· 财务数据、指数、ETF</li>
-                  </ul>
-                  <p className="mt-2 text-[11px] text-danger/90">
-                    操作不可恢复，需重新执行同步才能恢复数据。
-                  </p>
-                  <div className="mt-2 flex items-start gap-1.5 text-[11px] text-warning">
-                    <Info className="h-3.5 w-3.5 shrink-0 mt-px text-warning" />
-                    <span>此操作不会清除扩展数据，如需删除请在扩展数据设置中单独操作。</span>
+                  <div className="mt-3 space-y-2 text-[11px] leading-relaxed">
+                    <div>
+                      <div className="font-medium text-danger">会删除</div>
+                      <p className="text-muted">股票、指数、ETF、财务、盘口、新闻、标的池，以及扩展表 Parquet 数据。</p>
+                    </div>
+                    <div>
+                      <div className="font-medium text-accent">会保留</div>
+                      <p className="text-muted">量化实验、模型、回测、AI 报告、策略、自选与告警、任务历史、扩展定义、设置和凭据。</p>
+                    </div>
+                    <div>
+                      <div className="font-medium text-warning">会自动重建</div>
+                      <p className="text-muted">财联社快讯继续每 60 秒同步；行情、指标和盘口按原调度重新生成。</p>
+                    </div>
                   </div>
                 </div>
               </div>

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 
 import polars as pl
@@ -19,9 +20,10 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from app.indicators.pipeline import run_pipeline
 from app.config import settings
+from app.indicators.pipeline import run_pipeline
 from app.services import index_sync, instrument_sync, kline_sync, preferences as _prefs
+from app.services.finance_news import BEIJING_TZ, FinanceNewsService
 from app.tickflow.capabilities import Cap, CapabilitySet
 from app.tickflow.pools import DEMO_SYMBOLS, get_pool
 from app.tickflow.repository import KlineRepository
@@ -834,7 +836,11 @@ def _register_review_job(scheduler, repo, hour: int, minute: int) -> None:
     )
 
 
-def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOScheduler:
+def start_scheduler(
+    repo: KlineRepository,
+    capset: CapabilitySet,
+    finance_news_service: FinanceNewsService | None = None,
+) -> AsyncIOScheduler:
     """启动调度器。
 
     工作日 09:10 — 同步个股维表
@@ -845,6 +851,18 @@ def start_scheduler(repo: KlineRepository, capset: CapabilitySet) -> AsyncIOSche
     inst_sched = preferences.get_instruments_schedule()
 
     scheduler = AsyncIOScheduler(timezone="Asia/Shanghai")
+
+    if finance_news_service is not None:
+        scheduler.add_job(
+            finance_news_service.scheduled_sync,
+            trigger=IntervalTrigger(seconds=60),
+            id="finance_news_cls",
+            next_run_time=datetime.now(BEIJING_TZ),
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=30,
+            replace_existing=True,
+        )
 
     # 盘前: 同步 instruments（时间由偏好决定）
     def _instruments_task(on_progress=None):

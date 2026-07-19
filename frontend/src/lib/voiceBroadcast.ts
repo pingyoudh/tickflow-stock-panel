@@ -161,6 +161,30 @@ function buildText(alerts: AlertEvent[]): string {
 let _speaking = false
 
 /**
+ * 使用当前语音包和语速播报任意短文本。
+ * 调用方负责自己的业务开关；与监控告警共享忙碌状态，避免声音叠加。
+ */
+export function speakVoiceText(text: string): boolean {
+  try {
+    if (!text.trim() || !isVoiceSupported() || _speaking) return false
+
+    const u = new SpeechSynthesisUtterance(text)
+    u.lang = 'zh-CN'
+    u.rate = parseFloat(localStorage.getItem(LS.rate) || '1')
+    const v = resolveVoice()
+    if (v) u.voice = v
+
+    _speaking = true
+    u.onend = () => { _speaking = false }
+    u.onerror = () => { _speaking = false }
+    window.speechSynthesis.speak(u)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
  * 播报一批监控告警 (从 localStorage 读配置)。
  * 整批合并成一句话; 正在播报时丢弃新批次 (与"整批一声"理念一致)。
  */
@@ -171,18 +195,7 @@ export function speakAlerts(alerts: AlertEvent[]) {
     if (!isVoiceSupported()) return                          // 不支持: 静默
     if (_speaking) return                                    // 正在念: 丢弃新批次
 
-    const text = buildText(alerts)
-    const u = new SpeechSynthesisUtterance(text)
-    u.lang = 'zh-CN'
-    u.rate = parseFloat(localStorage.getItem(LS.rate) || '1')
-
-    const v = resolveVoice()
-    if (v) u.voice = v
-
-    _speaking = true
-    u.onend = () => { _speaking = false }
-    u.onerror = () => { _speaking = false }
-    window.speechSynthesis.speak(u)
+    speakVoiceText(buildText(alerts))
   } catch {
     // 语音不可用时静默
   }

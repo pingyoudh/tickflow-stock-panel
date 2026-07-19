@@ -25,13 +25,13 @@ import math
 import os
 import threading
 import time
-from datetime import date, time as dt_time
-
-from app.market_time import cn_now, cn_today
-from pathlib import Path
+from contextlib import contextmanager, suppress
+from datetime import date, datetime, timedelta, timezone
+from datetime import time as dt_time
 
 import polars as pl
 
+from app.market_time import cn_now, cn_today
 from app.tickflow.capabilities import Cap
 from app.tickflow.rate_limits import chunked, resolve_limit, sleep_between_batches
 
@@ -51,6 +51,10 @@ RPM_MARGIN = 0.8
 # 间隔硬下限/上限(任何套餐)
 INTERVAL_HARD_MIN = 10.0
 INTERVAL_HARD_MAX = 300.0
+
+
+class DepthSyncInProgressError(RuntimeError):
+    """盘口正在拉取或落盘。"""
 
 
 class DepthService:
@@ -89,6 +93,72 @@ class DepthService:
 
     def set_app_state(self, app_state) -> None:
         self._app_state = app_state
+
+    @contextmanager
+    def exclusive_storage(self):
+        """非阻塞占用盘口写锁，供业务数据重置使用。"""
+        if not self._fetch_lock.acquire(blocking=False):
+            raise DepthSyncInProgressError("五档盘口正在同步中")
+        try:
+            yield
+        finally:
+            self._fetch_lock.release()
+
+    def status(self) -> dict:
+        with self._lock:
+            fetched_at = (
+                datetime.fromtimestamp(
+                    self._sealed_fetched_at,
+                    tz=timezone(timedelta(hours=8)),
+                ).isoformat(timespec="seconds")
+                if self._sealed_fetched_at
+                else None
+            )
+            return {
+                "syncing": self._fetch_lock.locked(),
+                "ready": self._sealed_ready,
+                "records": len(self._sealed_cache),
+                "latest_date": (
+                    self._sealed_date.isoformat() if self._sealed_date else None
+                ),
+                "last_success_at": fetched_at,
+            }
+
+    def clear_persisted_locked(self) -> dict[str, int]:
+        """清除盘口落盘与内存状态；调用方必须持有 exclusive_storage。"""
+        if not self._repo:
+            return {"deleted_files": 0, "deleted_bytes": 0}
+        root = self._repo.store.data_dir / "depth5"
+        deleted_files = 0
+        deleted_bytes = 0
+        if root.exists():
+            for path in (item for item in root.rglob("*") if item.is_file()):
+                try:
+                    deleted_bytes += path.stat().st_size
+                    path.unlink()
+                    deleted_files += 1
+                except OSError as exc:
+                    logger.warning("清理五档盘口文件失败 %s: %s", path, exc)
+            for directory in sorted(
+                (item for item in root.rglob("*") if item.is_dir()),
+                key=lambda item: len(item.parts),
+                reverse=True,
+            ):
+                with suppress(OSError):
+                    directory.rmdir()
+            with suppress(OSError):
+                root.rmdir()
+        with self._lock:
+            self._sealed_cache = {}
+            self._sealed_ready = False
+            self._sealed_date = None
+            self._sealed_fetched_ts = 0.0
+            self._sealed_fetched_at = 0.0
+            self._persisted_date = None
+        return {
+            "deleted_files": deleted_files,
+            "deleted_bytes": deleted_bytes,
+        }
 
     # ================================================================
     # 生命周期

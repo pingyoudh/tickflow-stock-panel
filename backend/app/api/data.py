@@ -2,16 +2,24 @@
 from __future__ import annotations
 
 import logging
-import os
 import threading
 import time
-from datetime import datetime, timezone
+from collections.abc import Callable
+from contextlib import AsyncExitStack, ExitStack
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 
 from app.indicators.pipeline import ENRICHED_COLUMNS
+from app.services.data_catalog import (
+    CatalogSnapshot,
+    apply_runtime_status,
+    clear_registered_business_data,
+    clearable_dimensions,
+    scan_catalog,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +36,7 @@ _STORAGE_TTL = 60.0  # storage 文件扫描独立 TTL,stage 写完不触发重�
 # 聚合慢的大表（分区数多、行数多），使用更长的 TTL
 _LARGE_TABLES = {"minute"}
 
-_storage_cache: dict[str, Any] | None = None
+_storage_cache: CatalogSnapshot | None = None
 _storage_cache_ts: float = 0.0
 _storage_lock = threading.Lock()
 
@@ -435,106 +443,6 @@ def _safe_aggregate_financials(repo) -> dict | None:
     }
 
 
-def _scan_dir_stats(dirpath: Path) -> tuple[int, float]:
-    """单次遍历统计目录下文件数和总大小(MB)。比 rglob+stat 快很多。"""
-    if not dirpath.exists():
-        return 0, 0.0
-    count = 0
-    total = 0
-    for entry in os.scandir(dirpath):
-        if entry.is_dir(follow_symlinks=False):
-            c, s = _scan_dir_recursive(entry)
-            count += c
-            total += s
-        elif entry.is_file(follow_symlinks=False):
-            try:
-                total += entry.stat().st_size
-            except OSError:
-                pass
-            count += 1
-    return count, round(total / 1048576, 2)
-
-
-def _scan_dir_recursive(entry: os.DirEntry) -> tuple[int, int]:
-    """递归统计一个 DirEntry 下的文件数和总字节数。"""
-    count = 0
-    total = 0
-    try:
-        for sub in os.scandir(entry.path):
-            if sub.is_dir(follow_symlinks=False):
-                c, s = _scan_dir_recursive(sub)
-                count += c
-                total += s
-            elif sub.is_file(follow_symlinks=False):
-                try:
-                    total += sub.stat().st_size
-                except OSError:
-                    pass
-                count += 1
-    except PermissionError:
-        pass
-    return count, total
-
-
-def _compute_storage(data_dir: Path) -> dict:
-    """单次遍历计算 storage 统计，避免多次 rglob。"""
-    import os
-
-    # 只统计关心的子目录
-    subdirs = {
-        "daily": data_dir / "kline_daily",
-        "enriched": data_dir / "kline_daily_enriched",
-        "index_daily": data_dir / "kline_index_daily",
-        "index_enriched": data_dir / "kline_index_enriched",
-        "index_instruments": data_dir / "instruments_index",
-        "etf_daily": data_dir / "kline_etf_daily",
-        "etf_enriched": data_dir / "kline_etf_enriched",
-        "etf_instruments": data_dir / "instruments_etf",
-        "etf_adj_factor": data_dir / "adj_factor_etf",
-        "minute": data_dir / "kline_minute",
-        "adj_factor": data_dir / "adj_factor",
-        "instruments": data_dir / "instruments",
-        "ext_data": data_dir / "ext_data",
-    }
-    stats = {}
-    total_size = 0
-    for key, d in subdirs.items():
-        fc, sz = _scan_dir_stats(d)
-        total_size += sz
-        stats[f"{key}_files"] = fc
-        stats[f"{key}_size_mb"] = sz
-
-    # total: 再加上其他零散文件(pools, financials, capabilities.json 等)
-    other_dirs = ["pools", "financials", "backtest_results", "screener_results", "ai_cache"]
-    for name in other_dirs:
-        d = data_dir / name
-        if d.exists():
-            _, s = _scan_dir_stats(d)
-            total_size += s
-
-    # financials 单独统计
-    fin_dir = data_dir / "financials"
-    if fin_dir.exists():
-        fc, sz = _scan_dir_stats(fin_dir)
-        stats["financials_files"] = fc
-        stats["financials_size_mb"] = sz
-        total_size += sz
-    for name in other_dirs:
-        d = data_dir / name
-        if d.exists():
-            _, s = _scan_dir_stats(d)
-            total_size += s
-    # 根目录散文件
-    for entry in os.scandir(data_dir):
-        if entry.is_file(follow_symlinks=False):
-            try:
-                total_size += entry.stat().st_size / 1048576
-            except OSError:
-                pass
-    stats["total_size_mb"] = round(total_size, 2)
-    return stats
-
-
 def _next_cron_run(scheduler, job_id: str) -> str | None:
     """读 APScheduler 下次执行时间。"""
     if not scheduler:
@@ -548,18 +456,22 @@ def _next_cron_run(scheduler, job_id: str) -> str | None:
     return None
 
 
-def _get_storage(data_dir: Path) -> dict:
-    """返回缓存的 storage 统计；走独立 TTL，stage 写完不触发重算。"""
+def _get_catalog(data_dir: Path) -> CatalogSnapshot:
+    """返回缓存的统一目录快照；每次过期只遍历磁盘一次。"""
     global _storage_cache, _storage_cache_ts
     now = time.time()
     with _storage_lock:
         if _storage_cache is not None and (now - _storage_cache_ts) < _STORAGE_TTL:
             return _storage_cache
-    fresh = _compute_storage(data_dir)
+    fresh = scan_catalog(data_dir)
     with _storage_lock:
         _storage_cache = fresh
         _storage_cache_ts = now
     return fresh
+
+
+def _get_storage(data_dir: Path) -> dict:
+    return _get_catalog(data_dir).legacy_storage
 
 
 def _last_finished(job_label: str) -> str | None:
@@ -590,103 +502,190 @@ def status(request: Request) -> dict:
     scheduler = getattr(request.app.state, "scheduler", None)
     data_dir = repo.store.data_dir
 
+    table_stats = {
+        "daily": _get_table_stats(
+            "daily", lambda: _safe_aggregate_daily(repo)
+        ),
+        "enriched": _get_table_stats(
+            "enriched", lambda: _safe_aggregate_enriched(repo)
+        ),
+        "index_daily": _get_table_stats(
+            "index_daily", lambda: _safe_aggregate_index_daily(repo)
+        ),
+        "index_enriched": _get_table_stats(
+            "index_enriched", lambda: _safe_aggregate_index_enriched(repo)
+        ),
+        "index_instruments": _get_table_stats(
+            "index_instruments",
+            lambda: _safe_aggregate_index_instruments(repo),
+        ),
+        "etf_daily": _get_table_stats(
+            "etf_daily", lambda: _safe_aggregate_etf_daily(repo)
+        ),
+        "etf_enriched": _get_table_stats(
+            "etf_enriched", lambda: _safe_aggregate_etf_enriched(repo)
+        ),
+        "etf_instruments": _get_table_stats(
+            "etf_instruments",
+            lambda: _safe_aggregate_etf_instruments(repo),
+        ),
+        "minute": _get_table_stats(
+            "minute", lambda: _safe_aggregate_minute(repo)
+        ),
+        "adj_factor": _get_table_stats(
+            "adj_factor", lambda: _safe_aggregate_adj_factor(repo)
+        ),
+        "instruments": _get_table_stats(
+            "instruments", lambda: _safe_aggregate_instruments(repo)
+        ),
+        "financials": _get_table_stats(
+            "financials", lambda: _safe_aggregate_financials(repo)
+        ),
+    }
+    catalog = _get_catalog(data_dir)
+    runtime: dict[str, dict[str, Any]] = {}
+    for dimension_id, stats in table_stats.items():
+        if not stats:
+            continue
+        live: dict[str, Any] = {
+            "earliest_at": stats.get("earliest_date"),
+            "latest_at": stats.get("latest_date") or stats.get("latest_as_of"),
+        }
+        if stats.get("rows"):
+            live["records"] = int(stats["rows"])
+        runtime[dimension_id] = live
+
+    news_service = getattr(request.app.state, "finance_news_service", None)
+    if news_service is not None:
+        news_status = news_service.status()
+        runtime["finance_news"] = {
+            "state": (
+                "error"
+                if news_status.get("last_error")
+                else "syncing"
+                if news_status.get("syncing")
+                or not news_status.get("backfill_completed")
+                else None
+            ),
+            "sync": {
+                "mode": "scheduled",
+                "last_success_at": news_status.get("last_success_at"),
+                "next_run_at": _next_cron_run(scheduler, "finance_news_cls"),
+                "error": news_status.get("last_error"),
+            },
+        }
+
+    depth_service = getattr(request.app.state, "depth_service", None)
+    if depth_service is not None:
+        depth_status = depth_service.status()
+        runtime["depth5"] = {
+            "state": "syncing" if depth_status.get("syncing") else None,
+            "latest_at": depth_status.get("latest_date"),
+            "sync": {
+                "mode": "scheduled",
+                "last_success_at": depth_status.get("last_success_at"),
+                "next_run_at": _next_cron_run(scheduler, "depth_finalize"),
+                "error": None,
+            },
+        }
+
+    dimensions = apply_runtime_status(catalog.dimensions, runtime)
     return {
-        "daily":       _get_table_stats("daily",       lambda: _safe_aggregate_daily(repo)),
-        "enriched":    _get_table_stats("enriched",    lambda: _safe_aggregate_enriched(repo)),
-    "index_daily":       _get_table_stats("index_daily",       lambda: _safe_aggregate_index_daily(repo)),
-    "index_enriched":    _get_table_stats("index_enriched",    lambda: _safe_aggregate_index_enriched(repo)),
-    "index_instruments": _get_table_stats("index_instruments", lambda: _safe_aggregate_index_instruments(repo)),
-    "etf_daily":         _get_table_stats("etf_daily",         lambda: _safe_aggregate_etf_daily(repo)),
-    "etf_enriched":      _get_table_stats("etf_enriched",      lambda: _safe_aggregate_etf_enriched(repo)),
-    "etf_instruments":   _get_table_stats("etf_instruments",   lambda: _safe_aggregate_etf_instruments(repo)),
-    "minute":      _get_table_stats("minute",      lambda: _safe_aggregate_minute(repo)),
-        "adj_factor":  _get_table_stats("adj_factor",  lambda: _safe_aggregate_adj_factor(repo)),
-        "instruments": _get_table_stats("instruments", lambda: _safe_aggregate_instruments(repo)),
-        "financials":  _get_table_stats("financials",  lambda: _safe_aggregate_financials(repo)),
-
-        # 文件层面信息(缓存)
+        **table_stats,
         "storage": _get_storage(data_dir),
-
-        # 调度
+        "dimensions": dimensions,
+        "unclassified": catalog.unclassified,
         "next_instruments_run": _next_cron_run(scheduler, "pre_market_instruments"),
-        "next_pipeline_run":    _next_cron_run(scheduler, "daily_pipeline"),
+        "next_pipeline_run": _next_cron_run(scheduler, "daily_pipeline"),
         "last_instruments_run": _last_finished("instruments"),
-        "last_pipeline_run":    _last_finished("pipeline"),
-        "checked_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
-        # 指标缓存就绪标志 (启动时 enriched 异步预热, 完成前为 false)
+        "last_pipeline_run": _last_finished("pipeline"),
+        "checked_at": datetime.now(UTC)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z"),
         "indicators_ready": getattr(request.app.state, "indicators_ready", True),
     }
 
 
 @router.post("/clear")
-def clear_data(request: Request):
-    """清除所有本地 Parquet 数据（保留 capabilities.json 和目录结构）。"""
-    import shutil
+async def clear_data(request: Request):
+    """仅重置业务数据，保留研究资产、系统历史、设置和凭据。"""
+    from app.services.depth_service import DepthSyncInProgressError
+    from app.services.finance_news import FinanceNewsSyncInProgressError
+    from app.services.pipeline_jobs import release_run_slot, try_acquire_run_slot
 
+    if not try_acquire_run_slot():
+        raise HTTPException(status_code=409, detail="全量数据管道正在运行")
     repo = request.app.state.repo
     data_dir = repo.store.data_dir
-    deleted = 0
+    news_service = getattr(request.app.state, "finance_news_service", None)
+    depth_service = getattr(request.app.state, "depth_service", None)
+    try:
+        try:
+            async with AsyncExitStack() as async_stack:
+                if news_service is not None:
+                    await async_stack.enter_async_context(
+                        news_service.exclusive()
+                    )
+                with ExitStack() as stack:
+                    if depth_service is not None:
+                        stack.enter_context(depth_service.exclusive_storage())
 
-    for sub in (
-        "kline_daily", "kline_daily_enriched", "kline_index_daily", "kline_index_enriched",
-        "kline_etf_daily", "kline_etf_enriched", "kline_etf_minute", "kline_minute",
-        "adj_factor", "adj_factor_etf", "instruments", "instruments_index", "instruments_etf", "pools", "financials",
-        "backtest_results", "screener_results", "ai_cache",
-    ):
-        d = data_dir / sub
-        if d.exists():
-            # 先删所有 parquet 文件
-            for f in d.rglob("*.parquet"):
-                f.unlink()
-                deleted += 1
-            # 再删除空的日期分区子目录（date=YYYY-MM-DD 等）
-            for child in list(d.iterdir()):
-                if child.is_dir():
-                    shutil.rmtree(child, ignore_errors=True)
+                    result = clear_registered_business_data(
+                        data_dir,
+                        exclude_ids={"finance_news", "depth5"},
+                    )
+                    news_result = (
+                        news_service.store.clear()
+                        if news_service is not None
+                        else {"deleted_files": 0, "deleted_bytes": 0}
+                    )
+                    depth_result = (
+                        depth_service.clear_persisted_locked()
+                        if depth_service is not None
+                        else {"deleted_files": 0, "deleted_bytes": 0}
+                    )
+        except (FinanceNewsSyncInProgressError, DepthSyncInProgressError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    # 清除同步历史（内存 + 磁盘 job_store/ 文件夹）
-    from app.services.pipeline_jobs import job_store
-    job_store.clear()
+        deleted_files = (
+            result["deleted_files"]
+            + news_result["deleted_files"]
+            + depth_result["deleted_files"]
+        )
+        deleted_bytes = (
+            result["deleted_bytes"]
+            + news_result["deleted_bytes"]
+            + depth_result["deleted_bytes"]
+        )
+        cleared_ids = sorted(
+            {definition.id for definition in clearable_dimensions()}
+        )
 
-    # 清除财务数据
-    fin_dir = data_dir / "financials"
-    for sub in ("metrics", "income", "balance_sheet", "cash_flow"):
-        fp = fin_dir / sub / "part.parquet"
-        if fp.exists():
-            fp.unlink()
-            deleted += 1
+        repo.clear_cache()
+        repo.rebuild_views()
+        repo.refresh_cache()
 
-    # 清除监控运行数据 (user_data 下仅清运行产物, 不动 monitor_rules/preferences/secrets 等用户配置)
-    # - 触发记录 alerts.jsonl
-    from app.services import alert_store
-    alert_store.clear(data_dir)
-    # - 待推送的实时通知队列 (进程内存)
-    qs = getattr(request.app.state, "quote_service", None)
-    if qs is not None:
-        qs.clear_pending_alerts()
+        from app.services.screener import ScreenerService
 
-    # 清除 Polars 缓存
-    # 先 clear_cache 无条件清空内存 (refresh_cache 在磁盘无数据时会提前 return,
-    # 导致 _enriched_cache 等旧数据残留 —— 清数据后看板仍显示旧数据的根因),
-    # 再 refresh_cache 尝试重载 (磁盘有数据则重建缓存)。
-    repo.clear_cache()
-    repo.refresh_cache()
+        ScreenerService.clear_history_cache()
+        from app.api.overview import invalidate_overview_cache
 
-    # 清除 Screener 进程级 _history_cache (TTL 缓存)
-    from app.services.screener import ScreenerService
-    ScreenerService.clear_history_cache()
-
-    # 清除 Overview 总览聚合结果缓存 (5s TTL)
-    from app.api.overview import invalidate_overview_cache
-    invalidate_overview_cache()
-
-    # 刷新 DuckDB 视图（空 parquet 目录也需要重新挂载）——
-    # 委托给 repository 的唯一权威实现, 覆盖全部视图 (此前这里内联的副本漏了几张)。
-    repo.rebuild_views()
-
-    logger.info("数据已清除: 删除 %d 个 parquet 文件", deleted)
-    invalidate_data_cache(None)
-    return {"deleted_files": deleted}
+        invalidate_overview_cache()
+        invalidate_data_cache(None)
+        logger.info(
+            "业务数据已清除: %d 个文件, %d 字节",
+            deleted_files,
+            deleted_bytes,
+        )
+        return {
+            "deleted_files": deleted_files,
+            "deleted_bytes": deleted_bytes,
+            "cleared_dimension_ids": cleared_ids,
+            "preserved_categories": ["research", "system"],
+            "rebuild_scheduled": True,
+        }
+    finally:
+        release_run_slot()
 
 
 # 各表字段说明
@@ -724,6 +723,16 @@ _TABLE_FIELD_DESC: dict[str, dict[str, str]] = {
         "amount": "成交额",
     },
     "kline_etf_enriched": ENRICHED_COLUMNS,
+    "kline_etf_minute": {
+        "symbol": "ETF代码",
+        "datetime": "分钟时间戳",
+        "open": "开盘价",
+        "high": "最高价",
+        "low": "最低价",
+        "close": "收盘价",
+        "volume": "成交量",
+        "amount": "成交额",
+    },
     "kline_minute": {
         "symbol": "股票代码",
         "datetime": "分钟时间戳",
@@ -736,6 +745,12 @@ _TABLE_FIELD_DESC: dict[str, dict[str, str]] = {
     },
     "adj_factor": {
         "symbol": "股票代码",
+        "timestamp": "除权除息时间戳(ms)",
+        "trade_date": "除权除息日",
+        "ex_factor": "复权因子",
+    },
+    "adj_factor_etf": {
+        "symbol": "ETF代码",
         "timestamp": "除权除息时间戳(ms)",
         "trade_date": "除权除息日",
         "ex_factor": "复权因子",
@@ -768,6 +783,49 @@ _TABLE_FIELD_DESC: dict[str, dict[str, str]] = {
         "asset_type": "资产类型(etf)",
         "source": "数据源",
     },
+    "depth5": {
+        "symbol": "股票代码",
+        "sealed_up": "是否为真实封涨停",
+        "sealed_down": "是否为真实封跌停",
+        "ask1_vol": "卖一挂单量",
+        "bid1_vol": "买一挂单量",
+        "status": "涨跌停状态",
+        "fetched_at": "盘口获取时间戳",
+    },
+    "finance_news": {
+        "news_id": "财联社新闻ID",
+        "source": "新闻来源",
+        "title": "标题",
+        "content": "正文",
+        "published_at": "发布时间(+08:00)",
+        "published_ts": "发布时间戳",
+        "modified_at": "最后修改时间(+08:00)",
+        "modified_ts": "最后修改时间戳",
+        "level": "财联社等级",
+        "recommend": "是否推荐",
+        "subjects_json": "关联题材(JSON)",
+        "stocks_json": "关联股票(JSON)",
+    },
+    "financials_metrics": {
+        "symbol": "股票代码",
+        "period_end": "报告期末",
+        "announce_date": "公告日期",
+    },
+    "financials_income": {
+        "symbol": "股票代码",
+        "period_end": "报告期末",
+        "announce_date": "公告日期",
+    },
+    "financials_balance_sheet": {
+        "symbol": "股票代码",
+        "period_end": "报告期末",
+        "announce_date": "公告日期",
+    },
+    "financials_cash_flow": {
+        "symbol": "股票代码",
+        "period_end": "报告期末",
+        "announce_date": "公告日期",
+    },
 }
 
 # view 名 → DuckDB 视图名
@@ -780,9 +838,17 @@ _SCHEMA_VIEWS: dict[str, str] = {
     "etf_daily": "kline_etf_daily",
     "etf_enriched": "kline_etf_enriched",
     "etf_instruments": "instruments_etf",
+    "etf_minute": "kline_etf_minute",
+    "etf_adj_factor": "adj_factor_etf",
     "minute": "kline_minute",
     "adj_factor": "adj_factor",
     "instruments": "instruments",
+    "depth5": "depth5",
+    "finance_news": "finance_news",
+    "financial_metrics": "financials_metrics",
+    "financial_income": "financials_income",
+    "financial_balance_sheet": "financials_balance_sheet",
+    "financial_cash_flow": "financials_cash_flow",
 }
 
 

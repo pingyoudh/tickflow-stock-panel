@@ -216,8 +216,8 @@ def _build_user_prompt(overview: dict, news: list[dict], focus: str) -> str:
         parts.extend([
             "",
             "## 近期市场新闻",
-            "(暂无新闻数据:本功能新闻检索能力将在后续版本接入。"
-            "消息催化一节请直接从量价异动给出可能的催化逻辑结论,不要编造具体消息,也不要复述本说明。)",
+            "(暂无可用新闻数据。消息催化一节请直接从量价异动给出可能的催化逻辑结论,"
+            "不要编造具体消息,也不要复述本说明。)",
         ])
 
     from app.services.ai_provider import sanitize_focus
@@ -272,7 +272,7 @@ async def recap_market_stream(
         quote_service / depth_service: 可选,数据装配依赖。
         as_of: 复盘日期,None 取最新有数据日。
         focus: 用户追加的复盘关注点。
-        news: 预检索的新闻列表(P1 不传,留 None 走降级说明;P3 由 news_search 注入)。
+        news: 可选的预检索新闻;不传时自动读取本地财联社快讯。
     """
     # 1. 装配市场总览
     overview = build_market_overview(repo, quote_service, depth_service, as_of)
@@ -287,6 +287,20 @@ async def recap_market_stream(
 
     emo = overview.get("emotion") or {}
 
+    effective_news = news
+    if effective_news is None:
+        try:
+            from app.config import settings
+            from app.services.finance_news import load_recap_news
+
+            effective_news = load_recap_news(
+                settings.data_dir,
+                date.fromisoformat(str(as_of_str)),
+            )
+        except Exception as exc:
+            logger.warning("复盘读取财联社快讯失败,降级为无新闻: %s", exc)
+            effective_news = []
+
     # 2. meta 事件(前端据此先渲染信号灯/看板)
     yield json.dumps({
         "type": "meta",
@@ -300,7 +314,7 @@ async def recap_market_stream(
     try:
         from app.services.ai_provider import stream_ai_text
 
-        user_prompt = _build_user_prompt(overview, news or [], focus)
+        user_prompt = _build_user_prompt(overview, effective_news, focus)
         async for delta in stream_ai_text(
             [
                 {"role": "system", "content": _SYSTEM_PROMPT},
