@@ -34,6 +34,7 @@ from app.api import (
     signals,
     stock_analysis,
     strategy,
+    ths_pg_sync,
     watchlist,
 )
 from app.api.routes import router as core_router
@@ -320,6 +321,7 @@ app.include_router(financials.router)
 app.include_router(stock_analysis.router)
 app.include_router(market_recap.router)
 app.include_router(finance_news.router)
+app.include_router(ths_pg_sync.router)
 app.include_router(settings_api.router)
 app.include_router(strategy.router)
 app.include_router(signals.router)

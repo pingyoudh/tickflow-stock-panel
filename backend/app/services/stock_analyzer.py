@@ -94,6 +94,7 @@ def _load_financials(data_dir: Path, symbol: str) -> dict[str, list[dict]]:
             continue
         if "period_end" in df.columns:
             df = df.sort("period_end", descending=True).head(2)  # 只取最近 2 期
+        import datetime
         import math
         rows = []
         for rec in df.to_dicts():
@@ -103,6 +104,8 @@ def _load_financials(data_dir: Path, symbol: str) -> dict[str, list[dict]]:
                     continue
                 if isinstance(v, float):
                     clean[k] = None if not math.isfinite(v) else v
+                elif isinstance(v, (datetime.date, datetime.datetime)):
+                    clean[k] = v.isoformat()
                 else:
                     clean[k] = v
             rows.append(clean)

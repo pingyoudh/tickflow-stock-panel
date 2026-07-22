@@ -1,7 +1,8 @@
-"""财务数据 API — 独立路由, Cap.FINANCIAL 门控。"""
+"""财务数据 API — 本地数据可读, 远程同步由 Cap.FINANCIAL 门控。"""
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 import polars as pl
 from fastapi import APIRouter, HTTPException, Request
@@ -35,11 +36,8 @@ def _require_financial(capset) -> None:
 
 @router.get("/status")
 def financial_status(request: Request):
-    """返回各财务表的同步状态。无需 FINANCIAL 权限（前端根据 available 决定是否展示）。"""
+    """返回本地财务表状态；同步权限与本地可读状态分开报告。"""
     capset = request.app.state.capabilities
-    if not _financial_allowed(capset):
-        return {"available": False, "tables": {}}
-
     data_dir = request.app.state.repo.store.data_dir
     tables = {}
 
@@ -51,17 +49,19 @@ def financial_status(request: Request):
                 tables[table] = {
                     "rows": len(df),
                     "symbols": df["symbol"].n_unique() if not df.is_empty() else 0,
+                    "updated_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
                 }
             except Exception:
-                tables[table] = {"rows": 0, "symbols": 0}
+                tables[table] = {"rows": 0, "symbols": 0, "updated_at": None}
         else:
-            tables[table] = {"rows": 0, "symbols": 0}
+            tables[table] = {"rows": 0, "symbols": 0, "updated_at": None}
 
     fs = getattr(request.app.state, "financial_scheduler", None)
     last_sync = fs.last_sync if fs else {}
 
     return {
-        "available": True,
+        "available": any(info["rows"] > 0 for info in tables.values()),
+        "can_sync": _financial_allowed(capset),
         "tables": tables,
         "last_sync": last_sync,
         # 服务端是否正在同步(手动触发)——前端据此显示"同步中"并防重复点击,
@@ -72,10 +72,7 @@ def financial_status(request: Request):
 
 @router.get("/metrics")
 def get_metrics(request: Request, symbol: str | None = None):
-    """查询核心财务指标。"""
-    capset = request.app.state.capabilities
-    _require_financial(capset)
-
+    """查询本地核心财务指标。"""
     df = get_financial_df(request.app.state.repo.store.data_dir, "metrics")
     if df.is_empty():
         return {"data": []}
@@ -86,10 +83,7 @@ def get_metrics(request: Request, symbol: str | None = None):
 
 @router.get("/income")
 def get_income(request: Request, symbol: str | None = None):
-    """查询利润表。"""
-    capset = request.app.state.capabilities
-    _require_financial(capset)
-
+    """查询本地利润表。"""
     df = get_financial_df(request.app.state.repo.store.data_dir, "income")
     if df.is_empty():
         return {"data": []}
@@ -100,10 +94,7 @@ def get_income(request: Request, symbol: str | None = None):
 
 @router.get("/balance-sheet")
 def get_balance_sheet(request: Request, symbol: str | None = None):
-    """查询资产负债表。"""
-    capset = request.app.state.capabilities
-    _require_financial(capset)
-
+    """查询本地资产负债表。"""
     df = get_financial_df(request.app.state.repo.store.data_dir, "balance_sheet")
     if df.is_empty():
         return {"data": []}
@@ -114,10 +105,7 @@ def get_balance_sheet(request: Request, symbol: str | None = None):
 
 @router.get("/cash-flow")
 def get_cash_flow(request: Request, symbol: str | None = None):
-    """查询现金流量表。"""
-    capset = request.app.state.capabilities
-    _require_financial(capset)
-
+    """查询本地现金流量表。"""
     df = get_financial_df(request.app.state.repo.store.data_dir, "cash_flow")
     if df.is_empty():
         return {"data": []}
@@ -165,9 +153,6 @@ async def analyze_financials(request: Request, req: AnalyzeRequest):
     逐 chunk 以 SSE 形式推给前端(JSON per line, 非 text/event-stream,
     以便前端用 ReadableStream 逐行解析,更简单可靠)。
     """
-    capset = request.app.state.capabilities
-    _require_financial(capset)
-
     if not req.symbol:
         raise HTTPException(400, "symbol 不能为空")
 
@@ -201,17 +186,12 @@ class SaveReportRequest(BaseModel):
 @router.get("/reports")
 def list_reports(request: Request):
     """获取全部历史报告(按时间降序,后端已裁剪到上限)。无需 FINANCIAL 能力读取列表元信息。"""
-    capset = request.app.state.capabilities
-    if not _financial_allowed(capset):
-        return {"reports": []}
     return {"reports": ai_reports.list_reports()}
 
 
 @router.post("/reports")
 def save_report(request: Request, req: SaveReportRequest):
     """保存一条报告。"""
-    capset = request.app.state.capabilities
-    _require_financial(capset)
     report = ai_reports.save_report({
         "symbol": req.symbol,
         "name": req.name,
@@ -226,7 +206,5 @@ def save_report(request: Request, req: SaveReportRequest):
 @router.delete("/reports/{report_id}")
 def delete_report(request: Request, report_id: str):
     """删除一条报告。"""
-    capset = request.app.state.capabilities
-    _require_financial(capset)
     ok = ai_reports.delete_report(report_id)
     return {"ok": ok}

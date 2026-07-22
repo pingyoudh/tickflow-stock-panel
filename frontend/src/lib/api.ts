@@ -51,7 +51,9 @@ export interface CapabilitiesResponse {
 // ===== Financials =====
 export interface FinancialStatus {
   available: boolean
-  tables: Record<string, { rows: number; symbols: number }>
+  /** 当前能力/数据源是否允许继续从远端同步；不影响读取已有本地文件 */
+  can_sync?: boolean
+  tables: Record<string, { rows: number; symbols: number; updated_at?: string | null }>
   last_sync: Record<string, string>
   /** 服务端是否正在同步(手动触发)——驱动"同步中"UI 并防重复点击 */
   syncing?: boolean
@@ -419,6 +421,61 @@ export interface FinanceNewsRefreshResult {
   updated: number
   latest_published_at: string | null
   synced_at: string
+}
+
+export interface DailyNewsSummaryRecord {
+  as_of: string
+  content: string
+  input_count: number
+  unique_count: number
+  latest_published_at: string | null
+  generated_at: string
+  provider: string
+  model: string
+  market_date?: string | null
+  market_snapshot_at?: string | null
+  market_ready?: boolean
+  tail_window?: boolean
+  eligible_count?: number
+  market_warnings?: string[]
+}
+
+export interface DailyNewsSummaryStatus {
+  as_of: string
+  current_news_count: number
+  current_unique_count: number
+  stale: boolean
+  market?: {
+    available: boolean
+    ready: boolean
+    market_date?: string | null
+    snapshot_at?: string | null
+    tail_window: boolean
+    eligible_count: number
+    warnings: string[]
+  }
+  summary: DailyNewsSummaryRecord | null
+}
+
+export interface DailyNewsSummaryEvent {
+  type: 'meta' | 'progress' | 'delta' | 'error' | 'done'
+  as_of?: string
+  input_count?: number
+  unique_count?: number
+  latest_published_at?: string | null
+  cache_hit?: boolean
+  stage?: 'grouping' | 'synthesis'
+  completed?: number
+  total?: number
+  content?: string
+  message?: string
+  generated_at?: string
+  market_date?: string | null
+  market_snapshot_at?: string | null
+  market_ready?: boolean
+  tail_window?: boolean
+  eligible_count?: number
+  market_warnings?: string[]
 }
 
 // ===== Strategy Engine =====
@@ -1892,6 +1949,18 @@ export const api = {
       `/api/pipeline/jobs?limit=${limit}`,
     ),
 
+  thsPgStatus: () => request<ThsPgStatus>('/api/ths-pg/status'),
+  thsPgSaveConfig: (url: string | null) =>
+    request<{ configured: boolean; masked_dsn: string }>('/api/ths-pg/config', {
+      method: 'PUT',
+      body: JSON.stringify({ url }),
+    }),
+  thsPgGaps: () => request<ThsPgGapAudit>('/api/ths-pg/gaps'),
+  thsPgSync: () => request<{ job_id: string; reused: boolean }>(
+    '/api/ths-pg/sync',
+    { method: 'POST' },
+  ),
+
   dataStatus: () => request<DataStatus>('/api/data/status'),
   dataClear: () => request<{
     deleted_files: number
@@ -2231,6 +2300,46 @@ export const api = {
   financeNewsRefresh: () =>
     request<FinanceNewsRefreshResult>('/api/finance-news/refresh', { method: 'POST' }),
 
+  financeNewsDailySummary: (asOf?: string) =>
+    request<DailyNewsSummaryStatus>(
+      `/api/finance-news/daily-summary${asOf ? `?as_of=${encodeURIComponent(asOf)}` : ''}`,
+    ),
+
+  async *financeNewsAnalyzeStream(force = false, asOf?: string): AsyncGenerator<DailyNewsSummaryEvent> {
+    const res = await fetch('/api/finance-news/daily-summary/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force, as_of: asOf ?? null }),
+    })
+    if (!res.ok) {
+      let detail = ''
+      try { const j = JSON.parse(await res.text()); detail = j.detail ?? j.message ?? '' } catch { /* ignore */ }
+      const msg = detail || `${res.status} ${res.statusText}`
+      toast(msg, 'error')
+      throw new Error(msg)
+    }
+    if (!res.body) throw new Error('响应无 body')
+
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buf = ''
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      const lines = buf.split('\n')
+      buf = lines.pop() ?? ''
+      for (const line of lines) {
+        const value = line.trim()
+        if (!value) continue
+        try { yield JSON.parse(value) } catch { /* ignore */ }
+      }
+    }
+    if (buf.trim()) {
+      try { yield JSON.parse(buf.trim()) } catch { /* ignore */ }
+    }
+  },
+
   // ===== 大盘复盘 =====
   reviewReportsList: () =>
     request<{ reports: AiReviewReport[] }>('/api/market-recap/reports'),
@@ -2558,11 +2667,79 @@ export interface PipelineJob {
     index_daily_rows?: number
     minute_rows: number
     skipped_stages?: string[]
+    financial_metrics?: {
+      rows_written?: number
+      snapshot_rows_written?: number
+      timeseries_rows_written?: number
+      last_synced_date?: string | null
+    }
+    block_membership?: {
+      rows_written?: number
+      dates_written?: number
+      last_synced_date?: string | null
+    }
+    st_status?: {
+      rows_written?: number
+      dates_written?: number
+      last_synced_date?: string | null
+    }
+    synced_at?: string
   } | null
   error: string | null
 }
 
 export type PipelineJobSummary = Omit<PipelineJob, 'log'>
+
+// ===== THS Postgres readonly gap sync =====
+export type ThsPgGapStatus =
+  | 'covered'
+  | 'missing'
+  | 'snapshot_only'
+  | 'not_usable'
+  | 'deferred_heavy'
+
+export interface ThsPgCoverage {
+  rows?: number | null
+  min_date?: string | null
+  max_date?: string | null
+  symbols?: number | null
+  files?: number
+  mode?: string | null
+  extra?: Record<string, any> | null
+}
+
+export interface ThsPgGapItem {
+  id: string
+  label: string
+  status: ThsPgGapStatus
+  recommended: boolean
+  reason: string
+  local: ThsPgCoverage
+  source?: ThsPgCoverage | null
+}
+
+export interface ThsPgGapAudit {
+  configured: boolean
+  readonly_ok: boolean
+  error?: string | null
+  checked_at: string
+  items: ThsPgGapItem[]
+}
+
+export interface ThsPgStatus {
+  configured: boolean
+  masked_dsn: string
+  state: {
+    datasets?: Record<string, {
+      last_success_at?: string | null
+      last_synced_date?: string | null
+      rows_written?: number | null
+      dates_written?: number | null
+      updated_at?: string | null
+      [key: string]: any
+    }>
+  }
+}
 
 // ===== Data status =====
 interface TableStats {

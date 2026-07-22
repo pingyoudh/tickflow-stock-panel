@@ -16,6 +16,10 @@ export const STAGE_LABELS: Record<string, string> = {
   extend_history: '扩展日K历史',
   extend_minute: '扩展分钟K历史',
   rebuild_enriched: '全量计算',
+  ths_pg_connect: 'THS 只读连接',
+  ths_pg_financial_metrics: 'THS 财务指标',
+  ths_pg_block_membership: 'THS 历史板块',
+  ths_pg_st_status: 'THS ST 状态',
   refresh_views: '刷新视图',
   done: '完成',
 }
@@ -111,7 +115,20 @@ export function ActiveJobCard({ job }: { job: PipelineJob }) {
 
       <LogViewer log={job.log} />
 
-      {job.status === 'succeeded' && job.result && (() => {
+      {job.status === 'succeeded' && job.result && (
+        job.result.financial_metrics || job.result.block_membership || job.result.st_status
+      ) && (
+        <div className="mt-3 grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
+          <Pill label="财务指标" value={`${job.result.financial_metrics?.rows_written ?? 0} 行`} />
+          <Pill label="历史板块" value={`${job.result.block_membership?.rows_written ?? 0} 行`} />
+          <Pill label="板块日期" value={job.result.block_membership?.dates_written ?? 0} />
+          <Pill label="ST状态" value={`${job.result.st_status?.rows_written ?? 0} 行`} />
+        </div>
+      )}
+
+      {job.status === 'succeeded' && job.result && !(
+        job.result.financial_metrics || job.result.block_membership || job.result.st_status
+      ) && (() => {
         const skipped = new Set(job.result.skipped_stages ?? [])
         const cell = (stage: string | null, v: string) =>
           stage && skipped.has(stage) ? '跳过' : v

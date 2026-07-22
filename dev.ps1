@@ -131,15 +131,43 @@ if (-not [string]::IsNullOrWhiteSpace($BackendExtras)) {
     }
 }
 
-if (-not (Test-Path (Join-Path $BackendDir '.venv')) -or $BackendExtraArgs.Count) {
+$BackendVenvDir = Join-Path $BackendDir '.venv'
+$BackendSyncStamp = Join-Path $BackendVenvDir '.tickflow-dev-sync.stamp'
+$BackendManifestFiles = @(
+    Join-Path $BackendDir 'pyproject.toml',
+    Join-Path $BackendDir 'uv.lock'
+)
+
+$NeedBackendSync = -not (Test-Path $BackendVenvDir)
+if (-not $NeedBackendSync -and $BackendExtraArgs.Count) {
+    $NeedBackendSync = $true
+}
+if (-not $NeedBackendSync) {
+    if (-not (Test-Path $BackendSyncStamp)) {
+        $NeedBackendSync = $true
+    } else {
+        $BackendSyncTime = (Get-Item $BackendSyncStamp).LastWriteTimeUtc
+        foreach ($manifest in $BackendManifestFiles) {
+            if ((Test-Path $manifest) -and (Get-Item $manifest).LastWriteTimeUtc -gt $BackendSyncTime) {
+                $NeedBackendSync = $true
+                break
+            }
+        }
+    }
+}
+
+if ($NeedBackendSync) {
     if ($BackendExtraArgs.Count) {
         Log-Info "syncing Python deps with extras: $BackendExtras"
-    } else {
+    } elseif (-not (Test-Path $BackendVenvDir)) {
         Log-Info 'first run - installing Python deps (1-2 min)...'
+    } else {
+        Log-Info 'backend dependency manifest changed - syncing Python deps...'
     }
     Push-Location $BackendDir
     try { & uv sync @BackendExtraArgs } finally { Pop-Location }
     if ($LASTEXITCODE -ne 0) { Log-Err 'uv sync failed'; exit 1 }
+    New-Item -ItemType File -Path $BackendSyncStamp -Force | Out-Null
     Log-Ok 'backend deps installed'
 }
 

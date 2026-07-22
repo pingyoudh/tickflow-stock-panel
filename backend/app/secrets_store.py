@@ -87,6 +87,15 @@ def get_ai_config(key: str, default: str = "") -> str:
     return getattr(settings, key, default) or default
 
 
+def get_ths_pg_url() -> str:
+    """取只读 THS Postgres DSN:secrets.json 优先,否则 .env。"""
+    val = load().get("ths_pg_url")
+    if val:
+        return val
+    from app.config import settings
+    return getattr(settings, "ths_postgres_url", "") or ""
+
+
 def mask(key: str, prefix: int = 4, suffix: int = 4) -> str:
     """脱敏显示。"""
     if not key:

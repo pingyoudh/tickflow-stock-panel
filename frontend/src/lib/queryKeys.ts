@@ -47,6 +47,8 @@ export const QK = {
   dataStatus:           ['data-status'] as const,
   pipelineJobs:         ['pipeline-jobs'] as const,
   pipelineJob:          (id: string) => ['pipeline-job', id] as const,
+  thsPgStatus:          ['ths-pg-status'] as const,
+  thsPgGaps:            ['ths-pg-gaps'] as const,
   extData:              ['ext-data'] as const,
   extDataRows:          (id: string, date?: string, limit?: number, columns?: string) => ['ext-data-rows', id, date, limit, columns] as const,
   analysisMenus:        ['analysis-menus'] as const,

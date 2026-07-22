@@ -8,6 +8,8 @@ import { News } from './News'
 const mocks = vi.hoisted(() => ({
   list: vi.fn(),
   refresh: vi.fn(),
+  summary: vi.fn(),
+  analyze: vi.fn(),
   toast: vi.fn(),
 }))
 
@@ -15,6 +17,8 @@ vi.mock('@/lib/api', () => ({
   api: {
     financeNewsList: mocks.list,
     financeNewsRefresh: mocks.refresh,
+    financeNewsDailySummary: mocks.summary,
+    financeNewsAnalyzeStream: mocks.analyze,
   },
 }))
 
@@ -82,6 +86,49 @@ describe('News page', () => {
       latest_published_at: firstItem.published_at,
       synced_at: '2026-07-18T10:32:00+08:00',
     })
+    mocks.summary.mockResolvedValue({
+      as_of: '2026-07-18',
+      current_news_count: 1,
+      current_unique_count: 1,
+      stale: false,
+      market: {
+        available: true,
+        ready: true,
+        market_date: '2026-07-18',
+        snapshot_at: '2026-07-18T14:45:00+08:00',
+        tail_window: true,
+        eligible_count: 1,
+        warnings: [],
+      },
+      summary: null,
+    })
+    mocks.analyze.mockImplementation(async function* () {
+      yield {
+        type: 'meta',
+        as_of: '2026-07-18',
+        input_count: 1,
+        unique_count: 1,
+        latest_published_at: firstItem.published_at,
+        cache_hit: false,
+        market_snapshot_at: '2026-07-18T14:45:00+08:00',
+        market_ready: true,
+        tail_window: true,
+        eligible_count: 1,
+        market_warnings: [],
+      }
+      yield { type: 'progress', stage: 'synthesis', completed: 1, total: 1, message: '正在生成当日综合总结' }
+      yield { type: 'delta', content: '# 今日结论\n## 市场主线\n机器人消息活跃 [N001]\n## 尾盘候选（研究筛选）\n浦发银行' }
+      yield {
+        type: 'done',
+        unique_count: 1,
+        generated_at: '2026-07-18T10:35:00+08:00',
+        market_snapshot_at: '2026-07-18T14:45:00+08:00',
+        market_ready: true,
+        tail_window: true,
+        eligible_count: 1,
+        market_warnings: [],
+      }
+    })
   })
 
   it('renders fallback title, sync states, expansion and cursor pagination', async () => {
@@ -115,6 +162,21 @@ describe('News page', () => {
 
     await waitFor(() => expect(mocks.refresh).toHaveBeenCalledTimes(1))
     expect(mocks.toast).toHaveBeenCalledWith('同步完成，新增或更新 1 条快讯', 'success')
+  })
+
+  it('streams and displays the daily news summary', async () => {
+    const user = userEvent.setup()
+    renderNews()
+    await screen.findByRole('heading', { name: '机器人板块出现异动' })
+
+    await user.click(screen.getByRole('button', { name: '生成报告' }))
+
+    expect(await screen.findByText('市场主线')).toBeInTheDocument()
+    expect(screen.getByText(/机器人消息活跃/)).toBeInTheDocument()
+    expect(screen.getByText('尾盘候选（研究筛选）')).toBeInTheDocument()
+    expect(screen.getByText('候选池 1')).toBeInTheDocument()
+    expect(screen.getByText('尾盘窗口')).toBeInTheDocument()
+    expect(mocks.analyze).toHaveBeenCalledWith(false)
   })
 
   it('retains stored news when a manual refresh conflicts or fails', async () => {

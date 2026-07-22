@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertTriangle,
   ChevronDown,
@@ -14,12 +14,14 @@ import {
 
 import { PageHeader } from '@/components/PageHeader'
 import { toast } from '@/components/Toast'
+import { MarkdownRenderer } from '@/components/financials/MarkdownRenderer'
 import { api, type FinanceNewsItem } from '@/lib/api'
 import { cn } from '@/lib/cn'
 import { financeNewsTitle } from '@/lib/financeNews'
 import { QK } from '@/lib/queryKeys'
 
 const PAGE_SIZE = 50
+type SummaryPhase = 'idle' | 'loading' | 'streaming' | 'done' | 'error'
 
 function formatPublishedAt(value: string) {
   const date = new Date(value)
@@ -148,6 +150,20 @@ function NewsRow({ item }: { item: FinanceNewsItem }) {
 export function News() {
   const queryClient = useQueryClient()
   const [refreshing, setRefreshing] = useState(false)
+  const [summaryPhase, setSummaryPhase] = useState<SummaryPhase>('idle')
+  const [summaryContent, setSummaryContent] = useState('')
+  const [summaryError, setSummaryError] = useState('')
+  const [summaryProgress, setSummaryProgress] = useState('')
+  const [summaryMeta, setSummaryMeta] = useState<{
+    unique_count?: number
+    latest_published_at?: string | null
+    generated_at?: string
+    market_snapshot_at?: string | null
+    market_ready?: boolean
+    tail_window?: boolean
+    eligible_count?: number
+    market_warnings?: string[]
+  } | null>(null)
   const newsQuery = useInfiniteQuery({
     queryKey: QK.financeNews,
     queryFn: ({ pageParam }) => api.financeNewsList(
@@ -165,14 +181,106 @@ export function News() {
       const changed = result.inserted + result.updated
       toast(changed > 0 ? `同步完成，新增或更新 ${changed} 条快讯` : '已是最新快讯', 'success')
       queryClient.invalidateQueries({ queryKey: QK.financeNews })
+      queryClient.invalidateQueries({ queryKey: ['finance-news', 'daily-summary'] })
     },
     onSettled: () => setRefreshing(false),
   })
+  const summaryQuery = useQuery({
+    queryKey: ['finance-news', 'daily-summary'],
+    queryFn: () => api.financeNewsDailySummary(),
+    refetchInterval: () => document.visibilityState === 'visible' ? 60_000 : false,
+  })
+
+  const startSummary = async () => {
+    if (summaryPhase === 'loading' || summaryPhase === 'streaming') return
+    const force = Boolean(summaryQuery.data?.summary)
+    setSummaryPhase('loading')
+    setSummaryContent('')
+    setSummaryError('')
+    setSummaryProgress('正在准备当日新闻')
+    setSummaryMeta(null)
+    let content = ''
+    try {
+      for await (const event of api.financeNewsAnalyzeStream(force)) {
+        if (event.type === 'meta') {
+          setSummaryMeta({
+            unique_count: event.unique_count,
+            latest_published_at: event.latest_published_at,
+            market_snapshot_at: event.market_snapshot_at,
+            market_ready: event.market_ready,
+            tail_window: event.tail_window,
+            eligible_count: event.eligible_count,
+            market_warnings: event.market_warnings,
+          })
+          setSummaryProgress(event.cache_hit ? '正在读取已有报告' : '正在合并新闻与盘面数据')
+        } else if (event.type === 'progress') {
+          setSummaryProgress(event.message ?? '正在生成总结')
+        } else if (event.type === 'delta' && event.content) {
+          content += event.content
+          setSummaryContent(content)
+          setSummaryPhase('streaming')
+        } else if (event.type === 'error') {
+          setSummaryError(event.message ?? '新闻总结失败')
+          setSummaryPhase('error')
+          return
+        } else if (event.type === 'done') {
+          setSummaryMeta(previous => ({
+            ...(previous ?? {}),
+            unique_count: event.unique_count ?? previous?.unique_count,
+            latest_published_at: event.latest_published_at ?? previous?.latest_published_at,
+            generated_at: event.generated_at,
+            market_snapshot_at: event.market_snapshot_at ?? previous?.market_snapshot_at,
+            market_ready: event.market_ready ?? previous?.market_ready,
+            tail_window: event.tail_window ?? previous?.tail_window,
+            eligible_count: event.eligible_count ?? previous?.eligible_count,
+            market_warnings: event.market_warnings ?? previous?.market_warnings,
+          }))
+          setSummaryPhase('done')
+          queryClient.invalidateQueries({ queryKey: ['finance-news', 'daily-summary'] })
+        }
+      }
+      if (content) setSummaryPhase('done')
+    } catch (error) {
+      setSummaryError(error instanceof Error ? error.message : '新闻总结失败')
+      setSummaryPhase('error')
+    }
+  }
 
   const pages = newsQuery.data?.pages ?? []
   const items = useMemo(() => pages.flatMap(page => page.items), [pages])
   const syncStatus = pages[0]?.sync_status
   const syncing = refreshing || refreshMutation.isPending || syncStatus?.syncing
+  const storedSummary = summaryQuery.data?.summary
+  const summaryRunning = summaryPhase === 'loading' || summaryPhase === 'streaming'
+  const visibleSummary = summaryPhase === 'idle'
+    ? storedSummary?.content ?? ''
+    : summaryContent || storedSummary?.content || ''
+  const summaryCount = summaryMeta?.unique_count
+    ?? storedSummary?.unique_count
+    ?? summaryQuery.data?.current_unique_count
+    ?? 0
+  const summaryLatestAt = summaryMeta?.latest_published_at
+    ?? storedSummary?.latest_published_at
+  const summaryGeneratedAt = summaryMeta?.generated_at ?? storedSummary?.generated_at
+  const marketSnapshotAt = summaryMeta?.market_snapshot_at
+    ?? storedSummary?.market_snapshot_at
+    ?? summaryQuery.data?.market?.snapshot_at
+  const marketReady = summaryMeta?.market_ready
+    ?? storedSummary?.market_ready
+    ?? summaryQuery.data?.market?.ready
+    ?? false
+  const tailWindow = summaryMeta?.tail_window
+    ?? storedSummary?.tail_window
+    ?? summaryQuery.data?.market?.tail_window
+    ?? false
+  const eligibleCount = summaryMeta?.eligible_count
+    ?? storedSummary?.eligible_count
+    ?? summaryQuery.data?.market?.eligible_count
+    ?? 0
+  const marketWarnings = summaryMeta?.market_warnings
+    ?? storedSummary?.market_warnings
+    ?? summaryQuery.data?.market?.warnings
+    ?? []
 
   return (
     <div className="min-h-full bg-base">
@@ -208,6 +316,85 @@ export function News() {
             <span className="min-w-0 break-words">最近同步失败：{syncStatus.last_error}，当前展示已保存内容</span>
           </div>
         )}
+
+        <section className="mb-3 border border-border bg-surface" aria-label="今日新闻与盘面分析">
+          <div className="flex flex-col gap-2 border-b border-border px-3 py-2.5 sm:flex-row sm:items-center sm:justify-between sm:px-4">
+            <div className="min-w-0">
+              <div className="flex items-center gap-1.5 text-sm font-semibold text-foreground">
+                <Sparkles className="h-3.5 w-3.5 text-accent" />
+                今日新闻与盘面分析
+                {summaryQuery.data?.stale && (
+                  <span className="rounded-sm border border-warning/30 bg-warning/10 px-1.5 py-0.5 text-[10px] font-normal text-warning">
+                    有新快讯
+                  </span>
+                )}
+                {!summaryQuery.isLoading && (
+                  <span className={cn(
+                    'rounded-sm border px-1.5 py-0.5 text-[10px] font-normal',
+                    marketReady
+                      ? 'border-accent/30 bg-accent/10 text-accent'
+                      : 'border-warning/30 bg-warning/10 text-warning',
+                  )}>
+                    {marketReady ? `候选池 ${eligibleCount}` : '盘面待校验'}
+                  </span>
+                )}
+                {tailWindow && (
+                  <span className="rounded-sm border border-accent/30 bg-accent/10 px-1.5 py-0.5 text-[10px] font-normal text-accent">
+                    尾盘窗口
+                  </span>
+                )}
+              </div>
+              <div className="mt-1 flex flex-wrap items-center gap-x-2 text-[10px] text-muted">
+                <span>{summaryCount} 条去重快讯</span>
+                {summaryLatestAt && <span>截至 {formatPublishedAt(summaryLatestAt).time}</span>}
+                {marketSnapshotAt && <span>盘面 {formatPublishedAt(marketSnapshotAt).time}</span>}
+                {summaryGeneratedAt && <span>{formatSyncTime(summaryGeneratedAt).replace('最近同步', '生成于')}</span>}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={startSummary}
+              disabled={summaryRunning || summaryQuery.isLoading}
+              className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-btn bg-accent px-3 text-xs font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+              title={storedSummary ? '重新分析今日新闻与盘面' : '分析今日新闻与盘面'}
+            >
+              {summaryRunning ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+              {summaryRunning ? '分析中' : storedSummary ? '重新分析' : '生成报告'}
+            </button>
+          </div>
+
+          {!summaryRunning && marketWarnings.length > 0 && (
+            <div className="flex items-start gap-2 border-b border-warning/20 bg-warning/[0.04] px-4 py-2 text-[11px] text-warning">
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>{marketWarnings[0]}</span>
+            </div>
+          )}
+
+          {summaryRunning && !visibleSummary && (
+            <div className="flex min-h-28 flex-col items-center justify-center gap-2 px-4 py-6 text-center">
+              <Loader2 className="h-5 w-5 animate-spin text-accent" />
+              <div className="text-xs text-secondary">{summaryProgress}</div>
+            </div>
+          )}
+          {summaryError && (
+            <div className="flex items-start gap-2 border-b border-danger/20 bg-danger/[0.05] px-4 py-2.5 text-xs text-danger">
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>{summaryError}</span>
+            </div>
+          )}
+          {visibleSummary ? (
+            <div className="max-h-[32rem] overflow-y-auto px-4 py-3 sm:px-5">
+              <MarkdownRenderer content={visibleSummary} />
+              {summaryPhase === 'streaming' && (
+                <span className="ml-0.5 inline-block h-4 w-1.5 animate-pulse bg-accent align-middle" />
+              )}
+            </div>
+          ) : !summaryRunning && !summaryError ? (
+            <div className="flex min-h-24 items-center justify-center px-4 py-5 text-xs text-muted">
+              尚无今日分析报告
+            </div>
+          ) : null}
+        </section>
 
         {newsQuery.isLoading ? (
           <div className="border border-border bg-surface">

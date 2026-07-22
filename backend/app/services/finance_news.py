@@ -272,7 +272,8 @@ class FinanceNewsStore:
     """财联社快讯的按日 Parquet 存储。"""
 
     def __init__(self, data_dir: Path) -> None:
-        self.root = Path(data_dir) / "finance_news" / "cls"
+        self.data_dir = Path(data_dir)
+        self.root = self.data_dir / "finance_news" / "cls"
         self.state_path = self.root / "sync_state.json"
         self._lock = threading.RLock()
 
@@ -376,7 +377,7 @@ class FinanceNewsStore:
     def _query(
         self,
         *,
-        limit: int,
+        limit: int | None,
         cursor: tuple[int, str] | None = None,
         start_ts: int | None = None,
         end_ts: int | None = None,
@@ -399,15 +400,13 @@ class FinanceNewsStore:
                 lazy = lazy.filter(pl.col("published_ts") >= start_ts)
             if end_ts is not None:
                 lazy = lazy.filter(pl.col("published_ts") <= end_ts)
-            rows = (
-                lazy.sort(
-                    ["published_ts", "news_id"],
-                    descending=[True, True],
-                )
-                .limit(limit)
-                .collect()
-                .to_dicts()
+            lazy = lazy.sort(
+                ["published_ts", "news_id"],
+                descending=[True, True],
             )
+            if limit is not None:
+                lazy = lazy.limit(limit)
+            rows = lazy.collect().to_dicts()
         return rows
 
     def list_page(self, limit: int, cursor: str | None = None) -> dict[str, Any]:
@@ -425,7 +424,12 @@ class FinanceNewsStore:
             "has_more": has_more,
         }
 
-    def list_between(self, start_ts: int, end_ts: int, limit: int) -> list[dict[str, Any]]:
+    def list_between(
+        self,
+        start_ts: int,
+        end_ts: int,
+        limit: int | None,
+    ) -> list[dict[str, Any]]:
         rows = self._query(limit=limit, start_ts=start_ts, end_ts=end_ts)
         return [_row_to_item(row) for row in rows]
 

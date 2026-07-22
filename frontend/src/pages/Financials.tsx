@@ -30,6 +30,8 @@ export function Financials() {
   const { data: caps } = useCapabilities()
   const hasFinancial = caps?.capabilities?.['financial'] != null
   const { data: status, isLoading } = useFinancialStatus()
+  const hasLocalData = status?.available ?? false
+  const canSync = status?.can_sync ?? hasFinancial
   const syncMut = useFinancialSync()
   // 同步进行中 = 服务端真值(status.syncing)或本地乐观态(请求已发出待确认)。
   // 乐观窗口:点击后到 invalidate 触发的 refetch 返回之间,status.syncing 暂为 false,
@@ -57,7 +59,7 @@ export function Financials() {
     rememberStock(symbol, name)
   }
 
-  if (!hasFinancial) {
+  if (!isLoading && !hasLocalData && !canSync) {
     return (
       <>
         <PageHeader title="财务分析" subtitle="利润表 / 资负表 / 现金流 / 关键指标 / AI分析 · Expert" />
@@ -68,7 +70,7 @@ export function Financials() {
             </div>
             <h3 className="mt-4 text-base font-semibold text-foreground">需要 Expert 套餐</h3>
             <p className="mt-2 text-xs leading-relaxed text-secondary">
-              财务数据接口仅 Expert 套餐可用。升级后此页自动显示财务数据面板。
+              当前没有本地财务数据；从 TickFlow 同步完整财报需要 Expert 套餐。
             </p>
             {/* 当前财务数据源(TickFlow)需付费,后续将接入免费数据源;期间欢迎在 issues 推荐免费源 */}
             <div className="mt-5 rounded-btn border border-accent/25 bg-accent/[0.05] px-3.5 py-3 text-left">
@@ -157,7 +159,9 @@ export function Financials() {
     <>
       <PageHeader
         title="财务分析"
-        subtitle="利润表 / 资负表 / 现金流 / 关键指标 / AI分析 · Expert"
+        subtitle={canSync
+          ? '利润表 / 资负表 / 现金流 / 关键指标 / AI分析 · Expert'
+          : '本地财务指标 / AI分析'}
         right={
           <div className="flex items-center gap-2">
             <LastStockChip stock={lastStock} onSelect={pick} />
@@ -171,17 +175,24 @@ export function Financials() {
                     : '同步中…'}
               </span>
             )}
-            <button
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-btn bg-gradient-to-r from-accent/25 to-accent/10 border border-accent/30 text-accent text-xs font-medium hover:from-accent/35 hover:to-accent/20 transition-all duration-150 disabled:opacity-40 disabled:cursor-not-allowed"
-              onClick={() => handleSync('all')}
-              disabled={syncing}
-              title={syncing ? '正在同步，请稍候…' : '同步全部财务表'}
-            >
-              {syncing
-                ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                : <RefreshCw className="h-3.5 w-3.5" />}
-              {syncing ? '同步中…' : '全部同步'}
-            </button>
+            {canSync ? (
+              <button
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-btn bg-gradient-to-r from-accent/25 to-accent/10 border border-accent/30 text-accent text-xs font-medium hover:from-accent/35 hover:to-accent/20 transition-all duration-150 disabled:opacity-40 disabled:cursor-not-allowed"
+                onClick={() => handleSync('all')}
+                disabled={syncing}
+                title={syncing ? '正在同步，请稍候…' : '同步全部财务表'}
+              >
+                {syncing
+                  ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  : <RefreshCw className="h-3.5 w-3.5" />}
+                {syncing ? '同步中…' : '全部同步'}
+              </button>
+            ) : (
+              <span className="inline-flex items-center gap-1.5 text-xs text-secondary" title="当前展示本地已有数据；远程同步需要 Expert 套餐">
+                <Lock className="h-3.5 w-3.5" />
+                本地只读
+              </span>
+            )}
           </div>
         }
       />
@@ -191,6 +202,13 @@ export function Financials() {
           <div className="flex items-center gap-2 rounded-card border border-accent/30 bg-accent/[0.06] px-3 py-2 text-xs text-accent">
             <Loader2 className="h-3.5 w-3.5 animate-spin shrink-0" />
             正在从 TickFlow 拉取财务数据，请稍候…
+          </div>
+        )}
+
+        {!canSync && available && (
+          <div className="flex items-center gap-2 rounded-card border border-accent/25 bg-accent/[0.05] px-3 py-2 text-xs text-secondary">
+            <Database className="h-3.5 w-3.5 shrink-0 text-accent" />
+            正在展示本地已有财务数据；当前套餐不能从 TickFlow 同步缺失的报表。
           </div>
         )}
 
@@ -233,16 +251,18 @@ export function Financials() {
                         )}
                         <span className="text-xs font-medium text-foreground">{label}</span>
                       </div>
-                      <button
-                        className="text-muted hover:text-accent transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-                        onClick={() => handleSync(key)}
-                        disabled={syncing}
-                        title={syncing ? '正在同步…' : `同步${label}`}
-                      >
-                        {syncing
-                          ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                          : <RefreshCw className="h-3.5 w-3.5" />}
-                      </button>
+                      {canSync && (
+                        <button
+                          className="text-muted hover:text-accent transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                          onClick={() => handleSync(key)}
+                          disabled={syncing}
+                          title={syncing ? '正在同步…' : `同步${label}`}
+                        >
+                          {syncing
+                            ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            : <RefreshCw className="h-3.5 w-3.5" />}
+                        </button>
+                      )}
                     </div>
                     <div className="mt-2 text-xl font-semibold tabular-nums text-foreground">
                       {fmtBigNum(info?.rows ?? 0)}
@@ -253,8 +273,8 @@ export function Financials() {
                     </div>
                     <div className="mt-auto pt-2 border-t border-border/40 text-[10px] text-muted flex items-center gap-1">
                       <Clock className="h-2.5 w-2.5 shrink-0" />
-                      {lsTime
-                        ? new Date(lsTime).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+                      {lsTime || info?.updated_at
+                        ? new Date(lsTime ?? info.updated_at!).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
                         : '尚未同步'}
                     </div>
                   </div>
@@ -311,12 +331,12 @@ export function Financials() {
             {/* 个股详情 / 空引导 */}
             <div className="pb-4">
               {selected ? (
-                <StockFinancialDetail symbol={selected.symbol} name={selected.name} />
+                <StockFinancialDetail symbol={selected.symbol} name={selected.name} canSync={canSync} />
               ) : (
                 <EmptyState
                   icon={Search}
                   title="未选择股票"
-                  hint="在上方搜索框输入股票代码或名称，选择后即可查看该股的核心指标、利润表、资产负债表与现金流量表。"
+                  hint="在上方搜索框输入股票代码或名称，选择后即可查看该股当前已有的本地财务数据。"
                 />
               )}
             </div>

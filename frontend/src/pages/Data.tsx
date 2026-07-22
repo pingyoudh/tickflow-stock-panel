@@ -54,6 +54,7 @@ import { CreateExtDialog } from '@/components/ext-data/CreateExtDialog'
 import { EditExtDialog } from '@/components/ext-data/EditExtDialog'
 import { NewsDataCard } from '@/components/data/NewsDataCard'
 import { PersistentAssetSections } from '@/components/data/PersistentAssetSections'
+import { ThsPgSyncCard } from '@/components/data/ThsPgSyncCard'
 
 function findDimension(
   dimensions: DataDimensionStatus[] | undefined,
@@ -294,6 +295,9 @@ export function Data() {
     if (job.data && (job.data.status === 'succeeded' || job.data.status === 'failed')) {
       qc.invalidateQueries({ queryKey: QK.dataStatus })
       qc.invalidateQueries({ queryKey: QK.pipelineJobs })
+      qc.invalidateQueries({ queryKey: QK.thsPgStatus })
+      qc.invalidateQueries({ queryKey: QK.thsPgGaps })
+      qc.invalidateQueries({ queryKey: QK.extData })
       const t = setTimeout(() => setActiveJobId(null), 5_000)
       return () => clearTimeout(t)
     }
@@ -360,6 +364,9 @@ export function Data() {
     extend_etf_history: 'etf',
     sync_minute: 'minute',
     extend_minute: 'minute',
+    ths_pg_financial_metrics: 'financials',
+    ths_pg_block_membership: 'ext_data',
+    ths_pg_st_status: 'ext_data',
   }
   const activeCard = isRunning && job.data ? STAGE_CARD[job.data.stage] ?? null : null
 
@@ -934,6 +941,15 @@ export function Data() {
             </div>
           </div>
         </div>
+
+        <ThsPgSyncCard
+          onJobStarted={(jobId) => {
+            setActiveJobId(jobId)
+            startTime.current = Date.now()
+          }}
+          disabled={isRunning}
+          job={job.data}
+        />
 
         {!!s?.unclassified.groups && (
           <div className="flex items-start gap-2 rounded-card border border-warning/35 bg-warning/5 px-3 py-2 text-xs">

@@ -15,6 +15,7 @@ import { toast } from '@/components/Toast'
 interface Props {
   symbol: string
   name: string
+  canSync?: boolean
 }
 
 type TabKey = 'metrics' | 'income' | 'balance_sheet' | 'cash_flow'
@@ -28,8 +29,8 @@ const TABS: { key: TabKey; label: string; icon: typeof TrendingUp }[] = [
 
 // 字段定义:键 → (中文名, 格式化类型)
 // pct=百分点(存的是 12.3 表示 12.3%); amount=金额(元,转亿/万亿); perShare=每股; num=普通数值(保留2位)
-type FmtType = 'pct' | 'amount' | 'perShare' | 'num'
-type FieldDef = { label: string; fmt: FmtType; group?: string }
+type FmtType = 'pct' | 'amount' | 'perShare' | 'num' | 'text' | 'date' | 'bool'
+type FieldDef = { key: string; label: string; fmt: FmtType; aliases?: string[] }
 
 const FIELD_DEFS: Record<TabKey, FieldDef[]> = {
   metrics: [
@@ -37,16 +38,34 @@ const FIELD_DEFS: Record<TabKey, FieldDef[]> = {
     { label: '稀释每股收益 EPS', fmt: 'perShare', key: 'eps_diluted' } as any,
     { label: '每股净资产 BPS', fmt: 'perShare', key: 'bps' } as any,
     { label: '每股经营现金流', fmt: 'perShare', key: 'ocfps' } as any,
-    { label: '净资产收益率 ROE', fmt: 'pct', key: 'roe' } as any,
+    { label: '净资产收益率 ROE', fmt: 'pct', key: 'roe', aliases: ['roe_avg_ths'] },
     { label: '稀释 ROE', fmt: 'pct', key: 'roe_diluted' } as any,
     { label: '总资产收益率 ROA', fmt: 'pct', key: 'roa' } as any,
-    { label: '销售毛利率', fmt: 'pct', key: 'gross_margin' } as any,
-    { label: '销售净利率', fmt: 'pct', key: 'net_margin' } as any,
-    { label: '资产负债率', fmt: 'pct', key: 'debt_to_asset_ratio' } as any,
-    { label: '营业收入同比增长', fmt: 'pct', key: 'revenue_yoy' } as any,
-    { label: '净利润同比增长', fmt: 'pct', key: 'net_income_yoy' } as any,
+    { label: '销售毛利率', fmt: 'pct', key: 'gross_margin', aliases: ['sales_gross_margin_ttm'] },
+    { label: '销售净利率', fmt: 'pct', key: 'net_margin', aliases: ['net_sales_margin_after_deduction'] },
+    { label: '资产负债率', fmt: 'pct', key: 'debt_to_asset_ratio', aliases: ['asset_liab_ratio'] },
+    { label: '营业收入同比增长', fmt: 'pct', key: 'revenue_yoy', aliases: ['revenue_yoy_sq', 'sq_total_revenue_yoy'] },
+    { label: '净利润同比增长', fmt: 'pct', key: 'net_income_yoy', aliases: ['sq_profit_dnrgal_yoy'] },
     { label: '经营现金/营收', fmt: 'pct', key: 'operating_cash_to_revenue' } as any,
     { label: '存货周转率', fmt: 'num', key: 'inventory_turnover' } as any,
+    { label: '净利润', fmt: 'amount', key: 'net_profit' },
+    { label: '公司自由现金流', fmt: 'amount', key: 'corp_free_cf' },
+    { label: '现金流利息保障倍数', fmt: 'num', key: 'cf_interest_coverage' },
+    { label: '货币资金', fmt: 'amount', key: 'currency_fund' },
+    { label: '短期借款', fmt: 'amount', key: 'short_term_borrow' },
+    { label: '单季毛利润同比', fmt: 'pct', key: 'gross_profit_lrr_sq' },
+    { label: '预测主营业务收入同比', fmt: 'pct', key: 'forecast_mbi_yoy' },
+    { label: '预测营业利润同比', fmt: 'pct', key: 'forecast_op_yoy' },
+    { label: '总市值', fmt: 'amount', key: 'market_value' },
+    { label: '公司价值', fmt: 'amount', key: 'compvalue' },
+    { label: '市盈率 PE', fmt: 'num', key: 'pe' },
+    { label: '市销率 PS-TTM', fmt: 'num', key: 'ps_ttm' },
+    { label: 'PEG', fmt: 'num', key: 'peg_lyr' },
+    { label: '流通股本', fmt: 'amount', key: 'total_float_shares' },
+    { label: '派息日', fmt: 'date', key: 'interest_paid_date' },
+    { label: '近期机构调研', fmt: 'bool', key: 'has_investigation' },
+    { label: '近期股东增减持', fmt: 'bool', key: 'has_shareholding_change' },
+    { label: '龙虎榜净买入占比', fmt: 'pct', key: 'dragon_tiger_net_buy_ratio' },
   ],
   income: [
     { label: '营业收入', fmt: 'amount', key: 'revenue' } as any,
@@ -96,24 +115,39 @@ const FIELD_DEFS: Record<TabKey, FieldDef[]> = {
   ],
 }
 
-function formatValue(v: number | null | undefined, fmt: FmtType): string {
-  if (v == null || Number.isNaN(v)) return '—'
+function fieldValue(row: Record<string, any>, def: FieldDef): unknown {
+  for (const key of [def.key, ...(def.aliases ?? [])]) {
+    if (row[key] != null) return row[key]
+  }
+  return null
+}
+
+function formatValue(v: unknown, fmt: FmtType): string {
+  if (v == null) return '—'
+  if (fmt === 'bool') return v ? '是' : '否'
+  if (fmt === 'text') return String(v)
+  if (fmt === 'date') {
+    const raw = String(v).replace(/\.0$/, '')
+    return /^\d{8}$/.test(raw) ? `${raw.slice(0, 4)}-${raw.slice(4, 6)}-${raw.slice(6, 8)}` : raw
+  }
+  const number = typeof v === 'number' ? v : Number(v)
+  if (!Number.isFinite(number)) return String(v)
   switch (fmt) {
     case 'pct':
       // 存储的是百分点(12.3 表示 12.3%),直接保留2位 + %
-      return `${v.toFixed(2)}%`
+      return `${number.toFixed(2)}%`
     case 'amount':
       // 金额(元)→ 亿/万亿;保留负号
-      return fmtBigNum(v)
+      return fmtBigNum(number)
     case 'perShare':
-      return fmtPrice(v, 2)
+      return fmtPrice(number, 2)
     case 'num':
     default:
-      return v.toFixed(2)
+      return number.toFixed(2)
   }
 }
 
-export function StockFinancialDetail({ symbol, name }: Props) {
+export function StockFinancialDetail({ symbol, name, canSync = false }: Props) {
   const [tab, setTab] = useState<TabKey>('metrics')
   // AI 分析:点击时检查历史,若已有同标的报告则二次确认
   const [checking, setChecking] = useState(false)
@@ -162,6 +196,9 @@ export function StockFinancialDetail({ symbol, name }: Props) {
     (b.period_end ?? '').localeCompare(a.period_end ?? '')
   )
   const fieldDefs = FIELD_DEFS[tab]
+  const visibleFieldDefs = rows.length > 0
+    ? fieldDefs.filter(def => rows.some(row => fieldValue(row, def) != null))
+    : fieldDefs
 
   // 头部报告期信息取最新一期(优先用当前 tab,兜底用 metrics)
   const latestPeriod = rows[0]?.period_end ?? metrics.data?.data?.[0]?.period_end ?? null
@@ -188,7 +225,7 @@ export function StockFinancialDetail({ symbol, name }: Props) {
           {latestPeriod && (
             <div className="flex items-center gap-1.5 text-xs text-secondary">
               <CalendarDays className="h-3.5 w-3.5" />
-              <span>报告期 <span className="font-mono">{latestPeriod}</span></span>
+              <span>数据日期 <span className="font-mono">{latestPeriod}</span></span>
               {latestAnnounce && (
                 <span className="text-muted">· 披露 {fmtDate(latestAnnounce)}</span>
               )}
@@ -232,7 +269,8 @@ export function StockFinancialDetail({ symbol, name }: Props) {
           </div>
         ) : rows.length === 0 ? (
           <div className="py-10 text-center text-xs text-muted">
-            暂无{TABS.find(t => t.key === tab)?.label}数据 — 可点击顶部「全部同步」拉取
+            暂无{TABS.find(t => t.key === tab)?.label}数据
+            {canSync ? ' — 可点击顶部「全部同步」拉取' : '（本地尚未导入）'}
           </div>
         ) : (
           <div className="space-y-5">
@@ -242,12 +280,12 @@ export function StockFinancialDetail({ symbol, name }: Props) {
                 {rows.length > 1 && (
                   <div className="text-[11px] text-muted mb-2 flex items-center gap-1.5">
                     <CalendarDays className="h-3 w-3" />
-                    报告期 <span className="font-mono text-secondary">{row.period_end}</span>
+                    数据日期 <span className="font-mono text-secondary">{row.period_end}</span>
                   </div>
                 )}
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-x-8 gap-y-0">
-                  {fieldDefs.map((def: any) => {
-                    const val = row[def.key]
+                  {visibleFieldDefs.map((def) => {
+                    const val = fieldValue(row, def)
                     return (
                       <div
                         key={def.key}
